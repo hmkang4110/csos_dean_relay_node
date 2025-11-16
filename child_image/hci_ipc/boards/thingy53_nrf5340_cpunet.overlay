@@ -1,0 +1,38 @@
+// /* Thingy:53 핀맵 기준 — GPIO 모드 */
+// &nrf_radio_fem {
+//     status = "okay";
+
+//     /* 이름을 binding에 맞게 변경! */
+//     tx-en-gpios = <&gpio0 30 GPIO_ACTIVE_HIGH>;  /* P0.30: TX_EN (기존 ctx-gpios) */
+//     rx-en-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;  /* P1.11: RX_EN (기존 crx-gpios) */
+//     mode-gpios  = <&gpio1 12 GPIO_ACTIVE_HIGH>;  /* P1.12: MODE */
+
+//     /* 필요 시 연결돼 있으면 추가 */
+//     /* pdn-gpios     = <&gpioX Y GPIO_ACTIVE_HIGH>; */
+//     /* ant-sel-gpios = <&gpioX Y GPIO_ACTIVE_HIGH>; */
+//     /* csn-gpios     = <&gpio0 24 GPIO_ACTIVE_LOW>; */ /* SPI 모드일 때 */
+// };
+
+    /* nRF21540 FEM node in GPIO mode */
+&nrf_radio_fem {
+    compatible = "nordic,nrf21540-fem";
+    status = "okay";
+
+    /* Thingy:53 pin map */
+    tx-en-gpios  = <&gpio0 30 GPIO_ACTIVE_HIGH>; /* P0.30: TX_EN  */
+    rx-en-gpios  = <&gpio1 11 GPIO_ACTIVE_HIGH>; /* P1.11: RX_EN  */
+    mode-gpios   = <&gpio1 12 GPIO_ACTIVE_HIGH>; /* P1.12: MODE   */
+    // ant-sel-gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>;/* P1.10: ANT_SEL*/
+    ant-sel-gpios = <&gpio1 10 GPIO_ACTIVE_LOW>;/* P1.10: ANT_SEL*/
+
+    /* PDN: 보드에서 MCU로 제어한다면 아래 한 줄을 실제 핀으로 넣고 주석 해제
+     * 예) pdn-gpios = <&gpio0 XX GPIO_ACTIVE_HIGH>;
+     * 보드에서 상시 ON (풀업)이라면 생략해도 됨.
+     */
+    // pdn-gpios    = <&gpio0 XX GPIO_ACTIVE_HIGH>;
+};
+
+/* Tie the FEM to the RADIO */
+&radio {
+    fem = <&nrf_radio_fem>;
+};

@@ -1,0 +1,15 @@
+# 1MiB 전체를 APP에 사용 (설정영역 안 쓰는 경우)
+app:
+  address: 0x00000000
+  size:    0x00100000
+
+
+
+# # peripheral_nus/pm_static.yml
+# app:
+#   address: 0x00000
+#   size: 0xE0000     # 필요에 맞게 (예: 896KB)
+#   region: flash_primary
+# sram_primary:
+#   address: 0x20000000
+#   size: 0x0006E000  # 필요에 맞게
