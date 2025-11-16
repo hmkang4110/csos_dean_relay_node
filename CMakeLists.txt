@@ -8,7 +8,6 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(central_and_peripheral_hr)
 
 # NORDIC SDK APP START
-target_sources(app PRIVATE
-  src/main.c
-)
+target_sources(app PRIVATE src/main.c)
 # NORDIC SDK APP END
+add_subdirectory(src)
