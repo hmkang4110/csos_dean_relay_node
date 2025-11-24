@@ -33,14 +33,17 @@
 #include <zephyr/settings/settings.h>
 
 /* MY SERVICE UUID HEADERS === */
-#include "ble.h"
-#include "config_service.h"
-#include "grideye_service.h"
-#include "peripheral_service.h"
-#include "env_service.h"
-#include "sound_service.h"
+// #include "ble.h"
+// #include "config_service.h"
+// #include "grideye_service.h"
+// #include "peripheral_service.h"
+// #include "env_service.h"
+// #include "sound_service.h"
+// #include "ubinos_service.h"
+
+#include "relay_stub_service.h"
 #include "inference_service.h"
-#include "ubinos_service.h"
+
 
 #define MAX_SUBS 24
 
@@ -85,13 +88,18 @@ static atomic_t initiating;
 
 static struct bt_gatt_subscribe_params subs[MAX_SUBS];
 static size_t subs_cnt;
+static uint16_t h_remote_rawdata;
+static uint16_t h_remote_seq_result;
+static uint16_t h_remote_debug_string;
 
 struct adv_match_ctx
 {
     bool name_match;
     char found_name[20];    // BT_GAP_MAX_NAME_LEN
 };
-static struct bt_conn *conn_connecting;
+static struct bt_conn *central_conn;
+static struct bt_conn *central_pending;
+static struct bt_conn *peripheral_conn;
 
 /* BLE CENTRAL PARAMETERS */
 #define BLE_SCAN_INTERVAL 80    /* 50 ms */
@@ -211,6 +219,11 @@ static void initiate_timeout_work_handler(struct k_work *work)
         LOG_WRN("[INITIATE] create timeout -> cancel");
         bt_le_create_conn_cancel();
         atomic_set(&initiating, 0);
+        if (central_pending)
+        {
+            bt_conn_unref(central_pending);
+            central_pending = NULL;
+        }
         scan_start_safe(300);
     }
 }
@@ -312,12 +325,10 @@ static void scan_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t typ
     char addr_str[BT_ADDR_LE_STR_LEN];
     int err;
 
-    bool is_uuid_exist = false;
-    struct bt_uuid adv_uuid;
-
-    if (conn_connecting) {
+    if (central_pending || central_conn) {
         return;
     }
+    struct bt_conn *tmp_conn = NULL;
 
     /* Connect only with connectable adv/scan rsp packet */
     if (type != BT_GAP_ADV_TYPE_ADV_IND &&
@@ -356,13 +367,22 @@ static void scan_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t typ
     err = bt_conn_le_create(addr,
                             BT_CONN_LE_CREATE_CONN,
                             BT_LE_CONN_PARAM_DEFAULT,
-                            &conn_connecting);
-    if (err) {
+                            &tmp_conn);
+    if (err) 
+    {
         LOG_WRN("[DEVICE FOUND] Create connection to %s failed (err %d)", addr_str, err);
+        if (tmp_conn) 
+        {
+            bt_conn_unref(tmp_conn);
+        }
         atomic_set(&initiating, 0);
         scan_start_safe(300);
         return;
-    } else {
+    }
+    else 
+    {
+        central_pending = bt_conn_ref(tmp_conn);
+        bt_conn_unref(tmp_conn);
         LOG_INF("[DEVICE FOUND] Creating connection to %s | [%s]", addr_str, ctx.found_name);
     }
 }
@@ -414,6 +434,25 @@ static uint8_t discover_func(struct bt_conn *conn,
 
         /* 2-1) Notify 지원하는 Characteristic 인가? */
         if (chrc->properties & BT_GATT_CHRC_NOTIFY) {
+
+            if (chrc->properties & BT_GATT_CHRC_NOTIFY)
+            {
+                if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_RAWDATA))
+                {
+                    h_remote_rawdata = value_handle;
+                    LOG_INF("[DISCOVER] found INFERENCE_RAWDATA char at 0x%04x", value_handle);
+                }
+                else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_SEQ_ANAL_RESULT))
+                {
+                    h_remote_seq_result = value_handle;
+                    LOG_INF("[DISCOVER] found INFERENCE_SEQ_ANAL_RESULT char at 0x%04x", value_handle);
+                }
+                else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_DEBUG_STRING))
+                {
+                    h_remote_debug_string = value_handle;
+                    LOG_INF("[DISCOVER] found INFERENCE_DEBUG_STRING char at 0x%04x", value_handle);
+                }
+            }
 
             if (subs_cnt >= MAX_SUBS) {
                 LOG_WRN("[DISCOVER] subscribe table full, skip");
@@ -480,25 +519,57 @@ static uint8_t generic_notify_cb(struct bt_conn *conn,
                                  const void *data,
                                  uint16_t length)
 {
+    int err = 0;
     if (!data) {
         LOG_INF("[NOTIFY] Unsubscribed from handle %u", params->value_handle);
         params->value_handle = 0;
         return BT_GATT_ITER_STOP;
     }
 
-    const uint8_t *p = data;
-    char buf[128];
-    int off = 0;
-
-    off += snprintk(buf + off, sizeof(buf) - off,
-                    "[NOTIFY] handle=%u len=%u data=",
-                    params->value_handle, length);
-
-    for (uint16_t i = 0; i < length && off < (int)sizeof(buf) - 3; i++) {
-        off += snprintk(buf + off, sizeof(buf) - off, "%02X ", p[i]);
+    uint16_t handle = params->value_handle;
+    if (handle == h_remote_rawdata && length == INFERENCE_RESULT_PACKET_SIZE)
+    {
+        err = bt_inference_rawdata_send((uint8_t *)data);
+        if (err)
+        {
+            LOG_WRN("[RELAY] INFERENCE_RAWDATA send failed (err %d)", err);
+        }
+    }
+    else if (handle == h_remote_seq_result)
+    {
+        // int err = bt_inference_seq_result_send((uint8_t *)data, length);
+        if (err)
+        {
+            LOG_WRN("[RELAY] INFERENCE_SEQ_ANAL_RESULT send failed (err %d)", err);
+        }
+    }
+    else if (handle == h_remote_debug_string)
+    {
+        err = bt_inference_debug_string_send((uint8_t *)data, length);
+        if (err)
+        {
+            LOG_WRN("[RELAY] INFERENCE_DEBUG_STRING send failed (err %d)", err);
+        }
+    }
+    else 
+    {
+        LOG_WRN("[NOTIFY] Unknown handle=0x%04x len=%u", handle, length);
     }
 
-    LOG_INF("%s", buf);
+    // const uint8_t *p = data;
+    // char buf[128];
+    // int off = 0;
+
+    // off += snprintk(buf + off, sizeof(buf) - off,
+    //                 "[NOTIFY] handle=%u len=%u data=",
+    //                 params->value_handle, length);
+
+    // for (uint16_t i = 0; i < length && off < (int)sizeof(buf) - 3; i++) {
+    //     off += snprintk(buf + off, sizeof(buf) - off, "%02X ", p[i]);
+    // }
+
+    // LOG_INF("%s", buf);
+
     return BT_GATT_ITER_CONTINUE;
 }
 
@@ -513,62 +584,155 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 
     /* connection failed */
     if (conn_err) {
+
         if (info.role == BT_CONN_ROLE_CENTRAL) {
-            LOG_WRN("[CONNECTED] Failed to connect to %s (err %u)", addr, conn_err);
-            if (conn) {
-                bt_conn_unref(conn);
+            /* CENTRAL: DEAN node 연결 실패 */
+            LOG_WRN("[CONNECTED] Failed to connect to peripheral %s (err %u)", addr, conn_err);
+
+            if (central_pending == conn) {
+                bt_conn_unref(central_pending);
+                central_pending = NULL;
             }
-            conn_connecting = NULL;
+
             atomic_set(&initiating, 0);
+            atomic_set(&scan_on, 0);
             scan_start_safe(300);
             return;
-        } else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
-            LOG_WRN("[CONNECTED] Failed to connect to central (err %u)", conn_err);
+        }
+        else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
+            /* PERIPHERAL: SLIMHUB 가 나한테 붙으려다 실패 */
+            LOG_WRN("[CONNECTED] Failed to accept central %s (err %u)", addr, conn_err);
+
+            if (peripheral_conn == conn) {
+                bt_conn_unref(peripheral_conn);
+                peripheral_conn = NULL;
+            }
+
+            /* 광고 다시 */
+            atomic_set(&adv_on, 0);
             adv_start_safe(300);
             return;
         }
-    } else {
+    }
+    else {
         /* connection success */
+
         if (info.role == BT_CONN_ROLE_CENTRAL) {
-            if (conn == conn_connecting) {
-                err = start_discovery(conn);
-                if (err) {
-                    LOG_WRN("[CONNECTED] start discovery error : %d", err);
-                    bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-                } else {
-                    LOG_INF("[CONNECTED] Connection established as central");
-                }
+            /* relay node 가 CENTRAL 로서 DEAN node 에 붙은 상황 */
+
+            if (central_pending == conn) {
+                /* 연결 완료 → active conn 으로 승격 */
+                central_conn = central_pending;
+                central_pending = NULL;
+            }
+            else if (!central_conn) {
+                /* 혹시 pending 없이 콜백이 온 경우 방어적으로 ref 확보 */
+                central_conn = bt_conn_ref(conn);
             }
 
-            conn_connecting = NULL;
+            err = start_discovery(central_conn);
+            if (err) {
+                LOG_WRN("[CONNECTED] start discovery error : %d", err);
+                bt_conn_disconnect(central_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            }
+            else {
+                LOG_INF("[CONNECTED] Connection established as CENTRAL to peripheral %s", addr);
+            }
+
             atomic_set(&initiating, 0);
             LOG_INF("[CONNECTED] New peripheral device connected : %s", addr);
-        } else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
-            LOG_INF("[CONNECTED] Connection established as peripheral : %s", addr);
+        }
+        else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
+            /* relay node 가 PERIPHERAL 로서 SLIMHUB 에 붙은 상황 */
+
+            if (!peripheral_conn) {
+                peripheral_conn = bt_conn_ref(conn);
+            }
+
+            LOG_INF("[CONNECTED] Connection established as PERIPHERAL with central %s", addr);
             atomic_set(&adv_on, 0);
         }
     }
 
-    LOG_INF("[CONNECTED] Connected: %s", addr);
+    LOG_INF("[CONNECTED] Connected: %s (role=%s)",
+            addr,
+            (info.role == BT_CONN_ROLE_CENTRAL) ? "CENTRAL" : "PERIPHERAL");
+
     atomic_set(&initiating, 0);
 }
+
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
     char addr[BT_ADDR_LE_STR_LEN];
+    struct bt_conn_info info;
+    int err;
 
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-    LOG_INF("[DISCONNECTED] Disconnected from %s (reason %u), scan restart",
-            addr, reason);
-
-    if (conn) {
-        bt_conn_unref(conn);
+    if (!conn) {
+        LOG_WRN("[DISCONNECTED] conn == NULL (reason %u)", reason);
+        return;
     }
-    conn_connecting = NULL;
-    atomic_set(&initiating, 0);
-    scan_start_safe(300);
+
+    err = bt_conn_get_info(conn, &info);
+    if (err) {
+        bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+        LOG_INF("[DISCONNECTED] Disconnected from %s (reason %u), but get_info failed (%d)",
+                addr, reason, err);
+        /* 여기서 conn 은 Zephyr 스택이 관리하는 포인터이므로 우리가 unref 하지 않음 */
+        return;
+    }
+
+    bt_addr_le_to_str(info.le.dst, addr, sizeof(addr));
+
+    if (info.role == BT_CONN_ROLE_PERIPHERAL) {
+        /* relay node 가 PERIPHERAL 로서 SLIMHUB 에 붙어 있던 연결이 끊어진 경우 */
+        LOG_INF("[DISCONNECTED] Central %s disconnected (reason %u) -> restart advertising",
+                addr, reason);
+
+        if (peripheral_conn == conn) {
+            bt_conn_unref(peripheral_conn);
+            peripheral_conn = NULL;
+        }
+
+        /* 필요하면 inference_svr 의 notify enable 플래그들 초기화 (옵션) */
+
+        atomic_set(&adv_on, 0);
+        adv_start_safe(300);
+    }
+    else if (info.role == BT_CONN_ROLE_CENTRAL) {
+        /* relay node 가 CENTRAL 로서 DEAN node 에 붙어 있던 연결이 끊어진 경우 */
+        LOG_INF("[DISCONNECTED] Peripheral %s disconnected (reason %u) -> restart scanning",
+                addr, reason);
+
+        if (central_conn == conn) {
+            bt_conn_unref(central_conn);
+            central_conn = NULL;
+        }
+        if (central_pending == conn) {
+            bt_conn_unref(central_pending);
+            central_pending = NULL;
+        }
+
+        atomic_set(&initiating, 0);
+
+        /* 구독 정보도 새 연결을 위해 정리 */
+        memset(subs, 0, sizeof(subs));
+        subs_cnt = 0;
+
+        atomic_set(&scan_on, 0);
+        scan_start_safe(300);
+    } else {
+        LOG_INF("[DISCONNECTED] Disconnected from %s (reason %u), unknown role=%d",
+                addr, reason, info.role);
+    }
+
+    /* ⚠️ 여기서 bt_conn_unref(conn)을 호출하지 않는다!
+     * 우리가 ref를 잡은 포인터(central_conn, central_pending, peripheral_conn)에 대해서만
+     * 위에서 unref 했으므로, conn 포인터는 Zephyr 스택이 알아서 정리한다.
+     */
 }
+
+
 
 /* External Called function*/
 int ble_relay_control_start(void)
