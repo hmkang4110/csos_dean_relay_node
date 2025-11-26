@@ -54,6 +54,10 @@ static void reset_work_handler(struct k_work *work);
 static void adv_restart_work_handler(struct k_work *work);
 static void scan_restart_work_handler(struct k_work *work);
 static void initiate_timeout_work_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(adv_restart_work, adv_restart_work_handler);
+K_WORK_DELAYABLE_DEFINE(scan_restart_work, scan_restart_work_handler);
+K_WORK_DELAYABLE_DEFINE(reset_work, reset_work_handler);
+K_WORK_DELAYABLE_DEFINE(initiating_timeout_work, initiate_timeout_work_handler);
 
 static void adv_start_safe(int delay_ms);
 static void adv_stop_safe(void);
@@ -68,13 +72,11 @@ static int hci_vs_read_adv_tx_power(int8_t *out_dbm);
 static uint8_t generic_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *params, const void *data, uint16_t length);
 static void connected(struct bt_conn *conn, uint8_t err);
 static void disconnected(struct bt_conn *conn, uint8_t reason);
-
-static struct bt_gatt_discover_params discover_params;
-
-K_WORK_DELAYABLE_DEFINE(adv_restart_work, adv_restart_work_handler);
-K_WORK_DELAYABLE_DEFINE(scan_restart_work, scan_restart_work_handler);
-K_WORK_DELAYABLE_DEFINE(reset_work, reset_work_handler);
-K_WORK_DELAYABLE_DEFINE(initiating_timeout_work, initiate_timeout_work_handler);
+static struct relay_session * get_session_by_hub_conn(struct bt_conn *conn);
+static struct relay_session * get_session_by_dean_conn(struct bt_conn *conn);
+static struct relay_session * find_empty_session(void);
+static int start_spoofed_advertising(struct relay_session *session);
+static void stop_spoofed_advertising(struct relay_session * session);
 
 /* GLOBAL PARAMETER DEFINITIONS */
 static uint32_t adv_backoff_ms = 200;
@@ -86,6 +88,7 @@ static atomic_t adv_on;
 static atomic_t scan_on;
 static atomic_t initiating;
 
+static struct bt_gatt_discover_params discover_params;
 static struct bt_gatt_subscribe_params subs[MAX_SUBS];
 static size_t subs_cnt;
 static uint16_t h_remote_rawdata;
@@ -100,6 +103,8 @@ struct adv_match_ctx
 static struct bt_conn *central_conn;
 static struct bt_conn *central_pending;
 static struct bt_conn *peripheral_conn;
+
+struct relay_session g_relay_sessions[MAX_RELAY_SESSIONS] = {0};
 
 /* BLE CENTRAL PARAMETERS */
 #define BLE_SCAN_INTERVAL 80    /* 50 ms */
@@ -171,42 +176,29 @@ static void adv_restart_work_handler(struct k_work *work)
 
     LOG_INF("[ADV] adv restart work handler");
 
-    err = bt_le_adv_start(BT_LE_ADV_CONN,
-                          adv_data,
-                          ARRAY_SIZE(adv_data),
-                          scan_rsp_data,
-                          ARRAY_SIZE(scan_rsp_data));
-    if (err == -EALREADY) {
-        LOG_INF("[ADV] adv already on");
-        atomic_set(&adv_on, 1);
-        adv_backoff_ms = 200;
-        return;
-    }
+    // err = bt_le_adv_start(BT_LE_ADV_CONN,
+    //                       adv_data,
+    //                       ARRAY_SIZE(adv_data),
+    //                       scan_rsp_data,
+    //                       ARRAY_SIZE(scan_rsp_data));
+    // if (err == -EALREADY) {
+    //     LOG_INF("[ADV] adv already on");
+    //     atomic_set(&adv_on, 1);
+    //     adv_backoff_ms = 200;
+    //     return;
+    // }
 
-    if (err == -EBUSY) {
-        LOG_WRN("[ADV] adv start busy, backoff %d ms", adv_backoff_ms);
-        adv_backoff_ms = MIN(adv_backoff_ms * 2, BACKOFF_CAP);
-        k_work_reschedule(&adv_restart_work, K_MSEC(adv_backoff_ms));
-        return;
-    }
+    // if (err == -EBUSY) {
+    //     LOG_WRN("[ADV] adv start busy, backoff %d ms", adv_backoff_ms);
+    //     adv_backoff_ms = MIN(adv_backoff_ms * 2, BACKOFF_CAP);
+    //     k_work_reschedule(&adv_restart_work, K_MSEC(adv_backoff_ms));
+    //     return;
+    // }
 
     if (!err) {
         atomic_set(&adv_on, 1);
         adv_backoff_ms = 200;
         scan_start_safe(1000);
-
-        err = hci_vs_write_adv_tx_power(20);
-        if (err == 0) {
-            int8_t eff;
-            if (hci_vs_read_adv_tx_power(&eff) == 0) {
-                LOG_INF("[HCI] ADV TX set=20 dBm, effective=%d dBm%s",
-                        eff, (eff > 8) ? "  <-- FEM-updated" : "");
-            } else {
-                LOG_ERR("[HCI] READ adv TX failed");
-            }
-        } else {
-            LOG_ERR("[HCI] WRITE adv TX(20) failed (%d)", err);
-        }
     } else {
         LOG_WRN("[ADV] bt_le_adv_start failed (err %d), retry", err);
         k_work_reschedule(&adv_restart_work, K_MSEC(300));
@@ -325,7 +317,8 @@ static void scan_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t typ
     char addr_str[BT_ADDR_LE_STR_LEN];
     int err;
 
-    if (central_pending || central_conn) {
+    if (find_empty_session() == NULL)
+    {
         return;
     }
     struct bt_conn *tmp_conn = NULL;
@@ -529,10 +522,17 @@ static uint8_t generic_notify_cb(struct bt_conn *conn,
     uint16_t handle = params->value_handle;
     if (handle == h_remote_rawdata && length == INFERENCE_RESULT_PACKET_SIZE)
     {
-        err = bt_inference_rawdata_send((uint8_t *)data);
-        if (err)
+        if (is_inference_notify_enabled() == false)
         {
-            LOG_WRN("[RELAY] INFERENCE_RAWDATA send failed (err %d)", err);
+            return BT_GATT_ITER_CONTINUE;
+        }
+        else 
+        {
+            err = bt_inference_rawdata_send((uint8_t *)data);
+            if (err)
+            {
+                LOG_WRN("[RELAY] INFERENCE_RAWDATA send failed (err %d)", err);
+            }
         }
     }
     else if (handle == h_remote_seq_result)
@@ -545,10 +545,17 @@ static uint8_t generic_notify_cb(struct bt_conn *conn,
     }
     else if (handle == h_remote_debug_string)
     {
-        err = bt_inference_debug_string_send((uint8_t *)data, length);
-        if (err)
+        if (is_inference_debug_string_notify_enabled() == false)
         {
-            LOG_WRN("[RELAY] INFERENCE_DEBUG_STRING send failed (err %d)", err);
+            return BT_GATT_ITER_CONTINUE;
+        }
+        else
+        {
+            err = bt_inference_debug_string_send((uint8_t *)data, length);
+            if (err)
+            {
+                LOG_WRN("[RELAY] INFERENCE_DEBUG_STRING send failed (err %d)", err);
+            }
         }
     }
     else 
@@ -620,30 +627,68 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
         if (info.role == BT_CONN_ROLE_CENTRAL) {
             /* relay node 가 CENTRAL 로서 DEAN node 에 붙은 상황 */
 
-            if (central_pending == conn) {
-                /* 연결 완료 → active conn 으로 승격 */
-                central_conn = central_pending;
-                central_pending = NULL;
-            }
-            else if (!central_conn) {
-                /* 혹시 pending 없이 콜백이 온 경우 방어적으로 ref 확보 */
-                central_conn = bt_conn_ref(conn);
-            }
+            // 빈 세션을 찾아 할당
+            struct relay_session *session = find_empty_session();
+            if (session)
+            {
+                session->is_active = true;
+                session->conn_dean = bt_conn_ref(conn);
 
-            err = start_discovery(central_conn);
-            if (err) {
-                LOG_WRN("[CONNECTED] start discovery error : %d", err);
-                bt_conn_disconnect(central_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+                LOG_INF("[CONNECTED] Session %d DEAN connected! Starting Proxy advertising...", session->index);
+                start_discovery(conn);
+                err = start_spoofed_advertising(session);
+                if (err)
+                {
+                    LOG_ERR("[CONNECTED] start_spoofed_advertising failed (err %d)", err);
+                }
+                else
+                {
+                    LOG_INF("[CONNECTED] Proxy advertising started for session %d", session->index);
+                    err = hci_vs_write_adv_tx_power(20);
+                    if (err == 0)
+                    {
+                        int8_t eff;
+                        if (hci_vs_read_adv_tx_power(&eff) == 0)
+                        {
+                            LOG_INF("[HCI] ADV TX set=20 dBm, effective=%d dBm%s",
+                                    eff, (eff > 8) ? "  <-- FEM-updated" : "");
+                        }
+                        else
+                        {
+                            LOG_ERR("[HCI] READ adv TX failed");
+                        }
+                    }
+                    else
+                    {
+                        LOG_ERR("[HCI] WRITE adv TX(20) failed (%d)", err);
+                    }
+                }
             }
-            else {
-                LOG_INF("[CONNECTED] Connection established as CENTRAL to peripheral %s", addr);
+            else
+            {
+                bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
             }
-
-            atomic_set(&initiating, 0);
-            LOG_INF("[CONNECTED] New peripheral device connected : %s", addr);
         }
-        else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
+        else if (info.role == BT_CONN_ROLE_PERIPHERAL) 
+        {
             /* relay node 가 PERIPHERAL 로서 SLIMHUB 에 붙은 상황 */
+
+            bool mapped = false;
+            for (int i=0; i < MAX_RELAY_SESSIONS; i++)
+            {
+                if (g_relay_sessions[i].is_active && g_relay_sessions[i].conn_dean != NULL)
+                {
+                    g_relay_sessions[i].conn_slimhub = bt_conn_ref(conn);
+                    mapped = true;
+                    LOG_INF("[CONNECTED] Session %d SLIMHUB connected!", g_relay_sessions[i].index);
+                    break;
+                }
+            }
+
+            if (!mapped) {
+                LOG_WRN("[CONNECTED] No active session found for SLIMHUB connection");
+                bt_conn_disconnect(conn, BT_HCI_ERR_UNACCEPT_CONN_PARAM);
+            }
 
             if (!peripheral_conn) {
                 peripheral_conn = bt_conn_ref(conn);
@@ -664,72 +709,146 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
+    struct relay_session *sess;
     char addr[BT_ADDR_LE_STR_LEN];
-    struct bt_conn_info info;
-    int err;
 
-    if (!conn) {
-        LOG_WRN("[DISCONNECTED] conn == NULL (reason %u)", reason);
-        return;
-    }
+    /* 로그용 주소 변환 (옵션) */
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-    err = bt_conn_get_info(conn, &info);
-    if (err) {
-        bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-        LOG_INF("[DISCONNECTED] Disconnected from %s (reason %u), but get_info failed (%d)",
-                addr, reason, err);
-        /* 여기서 conn 은 Zephyr 스택이 관리하는 포인터이므로 우리가 unref 하지 않음 */
-        return;
-    }
+    /* ------------------------------------------------------------------
+     * CASE 1: 끊어진 녀석이 DEAN Node (Central로 연결했던 것) 인지 확인
+     * ------------------------------------------------------------------ */
+    sess = get_session_by_dean_conn(conn);
+    if (sess) {
+        LOG_INF("[SESSION %d] DEAN Disconnected (%s, reason %u)", sess->index, addr, reason);
+        LOG_INF("  -> HARD RESET: Clearing session and stopping proxy adv.");
 
-    bt_addr_le_to_str(info.le.dst, addr, sizeof(addr));
-
-    if (info.role == BT_CONN_ROLE_PERIPHERAL) {
-        /* relay node 가 PERIPHERAL 로서 SLIMHUB 에 붙어 있던 연결이 끊어진 경우 */
-        LOG_INF("[DISCONNECTED] Central %s disconnected (reason %u) -> restart advertising",
-                addr, reason);
-
-        if (peripheral_conn == conn) {
-            bt_conn_unref(peripheral_conn);
-            peripheral_conn = NULL;
+        /* 1. 짝꿍 SLIMHUB가 있다면 강제로 끊어준다 (가상 연결이므로 본체가 없으면 무의미) */
+        if (sess->conn_slimhub) {
+            LOG_INF("  -> Disconnecting associated SLIMHUB");
+            bt_conn_disconnect(sess->conn_slimhub, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            
+            /* SLIMHUB의 disconnected 콜백이 또 불릴 수 있으므로 미리 NULL 처리 및 unref */
+            bt_conn_unref(sess->conn_slimhub);
+            sess->conn_slimhub = NULL;
         }
 
-        /* 필요하면 inference_svr 의 notify enable 플래그들 초기화 (옵션) */
+        /* 2. 이 DEAN을 흉내내던 가짜 Advertising 중지 */
+        stop_spoofed_advertising(sess);
 
-        atomic_set(&adv_on, 0);
-        adv_start_safe(300);
-    }
-    else if (info.role == BT_CONN_ROLE_CENTRAL) {
-        /* relay node 가 CENTRAL 로서 DEAN node 에 붙어 있던 연결이 끊어진 경우 */
-        LOG_INF("[DISCONNECTED] Peripheral %s disconnected (reason %u) -> restart scanning",
-                addr, reason);
+        /* 3. DEAN 연결 객체 해제 */
+        bt_conn_unref(sess->conn_dean);
+        sess->conn_dean = NULL;
 
-        if (central_conn == conn) {
-            bt_conn_unref(central_conn);
-            central_conn = NULL;
-        }
-        if (central_pending == conn) {
-            bt_conn_unref(central_pending);
-            central_pending = NULL;
-        }
+        /* 4. 세션 정보 초기화 (이제 이 슬롯은 빈 자리가 됨) */
+        memset(sess, 0, sizeof(struct relay_session));
 
-        atomic_set(&initiating, 0);
-
-        /* 구독 정보도 새 연결을 위해 정리 */
-        memset(subs, 0, sizeof(subs));
-        subs_cnt = 0;
-
-        atomic_set(&scan_on, 0);
+        /* 5. 빈 자리가 생겼으니, 다른 DEAN을 찾기 위해 스캔 재시작 */
         scan_start_safe(300);
-    } else {
-        LOG_INF("[DISCONNECTED] Disconnected from %s (reason %u), unknown role=%d",
-                addr, reason, info.role);
+        
+        return;
     }
 
-    /* ⚠️ 여기서 bt_conn_unref(conn)을 호출하지 않는다!
-     * 우리가 ref를 잡은 포인터(central_conn, central_pending, peripheral_conn)에 대해서만
-     * 위에서 unref 했으므로, conn 포인터는 Zephyr 스택이 알아서 정리한다.
-     */
+    /* ------------------------------------------------------------------
+     * CASE 2: 끊어진 녀석이 SLIMHUB (Peripheral로 연결됐던 것) 인지 확인
+     * ------------------------------------------------------------------ */
+    sess = get_session_by_hub_conn(conn);
+    if (sess) {
+        LOG_INF("[SESSION %d] SLIMHUB Disconnected (%s, reason %u)", sess->index, addr, reason);
+        LOG_INF("  -> SOFT RESET: Restarting proxy adv to lure SLIMHUB back.");
+
+        /* 1. SLIMHUB 연결 객체 해제 */
+        bt_conn_unref(sess->conn_slimhub);
+        sess->conn_slimhub = NULL;
+
+        /* 2. DEAN은 아직 붙어있으므로, SLIMHUB가 다시 붙을 수 있게 Advertising 재시작 */
+        /* 주의: sess->adv 핸들은 살아있으므로 start만 하면 됨 */
+        if (sess->adv) {
+            int err = bt_le_ext_adv_start(sess->adv, BT_LE_EXT_ADV_START_DEFAULT);
+            if (err) {
+                LOG_ERR("Failed to restart adv for session %d (err %d)", sess->index, err);
+            } else {
+                LOG_INF("  -> Proxy Advertising restarted.");
+            }
+        }
+        return;
+    }
+
+    /* ------------------------------------------------------------------
+     * CASE 3: 세션에 등록되지 않은 기타 연결 해제 (예: 연결 시도 중 실패 등)
+     * ------------------------------------------------------------------ */
+    LOG_INF("[DISCONNECTED] Unmapped connection %s (reason %u). Ignoring.", addr, reason);
+    
+    /* 여기서 conn unref를 하지 않습니다. 
+     * (우리가 세션에 등록하며 ref를 증가시킨 적이 없으므로, Zephyr 스택이 알아서 정리함) */
+}
+
+static struct relay_session * get_session_by_hub_conn(struct bt_conn *conn)
+{
+    for (int i = 0; i < MAX_RELAY_SESSIONS; i++)
+    {
+        if (g_relay_sessions[i].is_active && g_relay_sessions[i].conn_slimhub == conn)
+        {
+            return &g_relay_sessions[i];
+        }
+    }
+    return NULL;
+}
+
+static struct relay_session * get_session_by_dean_conn(struct bt_conn *conn)
+{
+    for (int i = 0; i < MAX_RELAY_SESSIONS; i++)
+    {
+        if (g_relay_sessions[i].is_active && g_relay_sessions[i].conn_dean == conn)
+        {
+            return &g_relay_sessions[i];
+        }
+    }
+    return NULL;
+}
+
+static struct relay_session * find_empty_session(void)
+{
+    for (int i = 0; i < MAX_RELAY_SESSIONS; i++)
+    {
+        if (!g_relay_sessions[i].is_active)
+        {
+            return &g_relay_sessions[i];
+        }
+    }
+    return NULL;
+}
+
+static int start_spoofed_advertising(struct relay_session *session)
+{
+    int err;
+    char name[30];
+
+    err = bt_id_create(&session->adv_id, NULL);
+    struct bt_le_adv_param adv_param = {
+        .id = session->adv_id,
+        .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
+        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
+        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
+    };
+
+    err = bt_le_ext_adv_create(&adv_param, NULL, &session->adv);
+    if (err)
+    {
+        LOG_ERR("[SPOOF ADV] ext adv create failed (err %d)", err);
+        return err;
+    }
+    return bt_le_ext_adv_start(session->adv, BT_LE_EXT_ADV_START_DEFAULT);
+}
+
+static void stop_spoofed_advertising(struct relay_session * session)
+{
+    if (session->adv)
+    {
+        bt_le_ext_adv_stop(session->adv);
+        bt_le_ext_adv_delete(session->adv);
+        session->adv = NULL;
+    }
 }
 
 
