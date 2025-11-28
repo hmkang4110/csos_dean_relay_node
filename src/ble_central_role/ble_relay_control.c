@@ -32,15 +32,6 @@
 /* ZEPHYR KCONFIG SETTINGS HEADERS */
 #include <zephyr/settings/settings.h>
 
-/* MY SERVICE UUID HEADERS === */
-// #include "ble.h"
-// #include "config_service.h"
-// #include "grideye_service.h"
-// #include "peripheral_service.h"
-// #include "env_service.h"
-// #include "sound_service.h"
-// #include "ubinos_service.h"
-
 #include "relay_stub_service.h"
 #include "inference_service.h"
 
@@ -53,7 +44,6 @@ LOG_MODULE_REGISTER(central_scan, LOG_LEVEL_INF);
 static void reset_work_handler(struct k_work *work);
 static void adv_restart_work_handler(struct k_work *work);
 static void scan_restart_work_handler(struct k_work *work);
-static void initiate_timeout_work_handler(struct k_work *work);
 
 static void adv_start_safe(int delay_ms);
 static void adv_stop_safe(void);
@@ -74,12 +64,10 @@ static struct bt_gatt_discover_params discover_params;
 K_WORK_DELAYABLE_DEFINE(adv_restart_work, adv_restart_work_handler);
 K_WORK_DELAYABLE_DEFINE(scan_restart_work, scan_restart_work_handler);
 K_WORK_DELAYABLE_DEFINE(reset_work, reset_work_handler);
-K_WORK_DELAYABLE_DEFINE(initiating_timeout_work, initiate_timeout_work_handler);
 
 /* GLOBAL PARAMETER DEFINITIONS */
 static uint32_t adv_backoff_ms = 200;
 static uint32_t scan_backoff_ms = 200;
-static uint32_t initiate_start_ms = 0;
 #define BACKOFF_CAP 2000
 
 static atomic_t adv_on;
@@ -131,6 +119,33 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 };
 
 /* KERNEL WORK HANDLERS */
+static void reset_work_handler(struct k_work *work)
+{
+    LOG_INF("[RESET] System Logic Reset");
+
+    /* Stop everything first to ensure clean state */
+    scan_stop_safe();
+    adv_stop_safe();
+
+    if (central_pending) {
+        bt_conn_unref(central_pending);
+        central_pending = NULL;
+    }
+
+    if (atomic_get(&initiating)) {
+        int err = bt_le_create_conn_cancel();
+        if (err && err != -EALREADY) {
+            LOG_WRN("[RESET] Create conn cancel failed (err %d)", err);
+        }
+    }
+
+    atomic_set(&initiating, 0);
+
+    /* Start both roles "simultaneously" (independent scheduling) */
+    adv_start_safe(100);
+    scan_start_safe(100);
+}
+
 static void scan_restart_work_handler(struct  k_work *work)
 {
     if (atomic_get(&scan_on) == 1) {
@@ -193,7 +208,7 @@ static void adv_restart_work_handler(struct k_work *work)
     if (!err) {
         atomic_set(&adv_on, 1);
         adv_backoff_ms = 200;
-        scan_start_safe(1000);
+        /* Removed automatic scan start - decoupled for multi-role */
 
         err = hci_vs_write_adv_tx_power(20);
         if (err == 0) {
@@ -210,21 +225,6 @@ static void adv_restart_work_handler(struct k_work *work)
     } else {
         LOG_WRN("[ADV] bt_le_adv_start failed (err %d), retry", err);
         k_work_reschedule(&adv_restart_work, K_MSEC(300));
-    }
-}
-
-static void initiate_timeout_work_handler(struct k_work *work)
-{
-    if (atomic_get(&initiating) == 1) {
-        LOG_WRN("[INITIATE] create timeout -> cancel");
-        bt_le_create_conn_cancel();
-        atomic_set(&initiating, 0);
-        if (central_pending)
-        {
-            bt_conn_unref(central_pending);
-            central_pending = NULL;
-        }
-        scan_start_safe(300);
     }
 }
 
@@ -361,8 +361,6 @@ static void scan_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t typ
 
     scan_stop_safe();
     atomic_set(&initiating, 1);
-    initiate_start_ms = k_uptime_get_32();
-    // k_work_reschedule(&initiating_timeout_work, K_SECONDS(10));
 
     err = bt_conn_le_create(addr,
                             BT_CONN_LE_CREATE_CONN,
@@ -752,7 +750,8 @@ int ble_relay_control_start(void)
         k_sleep(K_MSEC(500));
     }
 
-    adv_start_safe(0);
+    /* Schedule the reset work to start multi-role logic */
+    k_work_reschedule(&reset_work, K_NO_WAIT);
 
     return err;
 }
