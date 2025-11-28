@@ -32,15 +32,13 @@
 /* ZEPHYR KCONFIG SETTINGS HEADERS */
 #include <zephyr/settings/settings.h>
 
-/* MY SERVICE UUID HEADERS === */
-// #include "ble.h"
-// #include "config_service.h"
-// #include "grideye_service.h"
-// #include "peripheral_service.h"
-// #include "env_service.h"
-// #include "sound_service.h"
-// #include "ubinos_service.h"
-
+/* Service Headers for UUIDs */
+#include "ble.h"
+#include "config_service.h"
+#include "grideye_service.h"
+#include "peripheral_service.h"
+#include "env_service.h"
+#include "sound_service.h"
 #include "relay_stub_service.h"
 #include "inference_service.h"
 
@@ -53,7 +51,6 @@ LOG_MODULE_REGISTER(central_scan, LOG_LEVEL_INF);
 static void reset_work_handler(struct k_work *work);
 static void adv_restart_work_handler(struct k_work *work);
 static void scan_restart_work_handler(struct k_work *work);
-static void initiate_timeout_work_handler(struct k_work *work);
 
 static void adv_start_safe(int delay_ms);
 static void adv_stop_safe(void);
@@ -69,37 +66,57 @@ static uint8_t generic_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_
 static void connected(struct bt_conn *conn, uint8_t err);
 static void disconnected(struct bt_conn *conn, uint8_t reason);
 
+static void start_cloned_advertising(void);
+
 static struct bt_gatt_discover_params discover_params;
 
 K_WORK_DELAYABLE_DEFINE(adv_restart_work, adv_restart_work_handler);
 K_WORK_DELAYABLE_DEFINE(scan_restart_work, scan_restart_work_handler);
 K_WORK_DELAYABLE_DEFINE(reset_work, reset_work_handler);
-K_WORK_DELAYABLE_DEFINE(initiating_timeout_work, initiate_timeout_work_handler);
 
 /* GLOBAL PARAMETER DEFINITIONS */
 static uint32_t adv_backoff_ms = 200;
 static uint32_t scan_backoff_ms = 200;
-static uint32_t initiate_start_ms = 0;
 #define BACKOFF_CAP 2000
 
 static atomic_t adv_on;
 static atomic_t scan_on;
 static atomic_t initiating;
 
+/* Captured Target Data */
+static char captured_name[BT_GAP_ADV_MAX_NAME_LEN + 1];
+static struct bt_uuid_128 captured_uuids[5]; // Store a few captured UUIDs
+static int captured_uuid_count = 0;
+
+/* Remote Handles for Forwarding */
 static struct bt_gatt_subscribe_params subs[MAX_SUBS];
 static size_t subs_cnt;
+
+// Read/Notify handles
 static uint16_t h_remote_rawdata;
 static uint16_t h_remote_seq_result;
 static uint16_t h_remote_debug_string;
 
+// Write handles (Upstream Relay)
+static uint16_t h_remote_write_rawdata; // For INFERENCE_RAWDATA (Write/Read/Notify)
+static uint16_t h_remote_file_transfer;
+static uint16_t h_remote_device_name;
+static uint16_t h_remote_location;
+static uint16_t h_remote_grideye_prediction;
+
 struct adv_match_ctx
 {
     bool name_match;
-    char found_name[20];    // BT_GAP_MAX_NAME_LEN
+    char found_name[BT_GAP_ADV_MAX_NAME_LEN + 1];
+    struct bt_uuid_128 uuids[5];
+    int uuid_count;
 };
 static struct bt_conn *central_conn;
 static struct bt_conn *central_pending;
 static struct bt_conn *peripheral_conn;
+
+/* Extended Advertising Handle */
+static struct bt_le_ext_adv *adv;
 
 /* BLE CENTRAL PARAMETERS */
 #define BLE_SCAN_INTERVAL 80    /* 50 ms */
@@ -113,14 +130,16 @@ static struct bt_conn *peripheral_conn;
 #define BT_DEVICE_CONNECT_LIST_NUM  1
 
 /* BLE PERIPHERAL PARAMETERS */
+// Initial default name before cloning
 #define BLE_DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define BLE_DEVICE_NAME_LEN (sizeof(BLE_DEVICE_NAME) - 1)
 
-static const struct bt_data adv_data[] = {
+static struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     BT_DATA(BT_DATA_NAME_COMPLETE, BLE_DEVICE_NAME, BLE_DEVICE_NAME_LEN),
 };
-static const struct bt_data scan_rsp_data[] = {
+
+static struct bt_data sd[] = {
     BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_BASE_SERVICE_VAL),
 };
 
@@ -131,6 +150,32 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 };
 
 /* KERNEL WORK HANDLERS */
+static void reset_work_handler(struct k_work *work)
+{
+    LOG_INF("[RESET] System Logic Reset - Starting SCAN Only");
+
+    /* Stop everything first to ensure clean state */
+    scan_stop_safe();
+    adv_stop_safe();
+
+    if (central_pending) {
+        bt_conn_unref(central_pending);
+        central_pending = NULL;
+    }
+
+    if (atomic_get(&initiating)) {
+        int err = bt_le_create_conn_cancel();
+        if (err && err != -EALREADY) {
+            LOG_WRN("[RESET] Create conn cancel failed (err %d)", err);
+        }
+    }
+
+    atomic_set(&initiating, 0);
+
+    /* Start Scanning ONLY. Advertising waits for connection & cloning. */
+    scan_start_safe(100);
+}
+
 static void scan_restart_work_handler(struct  k_work *work)
 {
     if (atomic_get(&scan_on) == 1) {
@@ -163,69 +208,12 @@ static void scan_restart_work_handler(struct  k_work *work)
 
 static void adv_restart_work_handler(struct k_work *work)
 {
-    int err = 0;
-
+    /* Handled by Extended Advertising API now, but keeping safe guard structure */
     if (atomic_get(&adv_on)) {
         return;
     }
 
-    LOG_INF("[ADV] adv restart work handler");
-
-    err = bt_le_adv_start(BT_LE_ADV_CONN,
-                          adv_data,
-                          ARRAY_SIZE(adv_data),
-                          scan_rsp_data,
-                          ARRAY_SIZE(scan_rsp_data));
-    if (err == -EALREADY) {
-        LOG_INF("[ADV] adv already on");
-        atomic_set(&adv_on, 1);
-        adv_backoff_ms = 200;
-        return;
-    }
-
-    if (err == -EBUSY) {
-        LOG_WRN("[ADV] adv start busy, backoff %d ms", adv_backoff_ms);
-        adv_backoff_ms = MIN(adv_backoff_ms * 2, BACKOFF_CAP);
-        k_work_reschedule(&adv_restart_work, K_MSEC(adv_backoff_ms));
-        return;
-    }
-
-    if (!err) {
-        atomic_set(&adv_on, 1);
-        adv_backoff_ms = 200;
-        scan_start_safe(1000);
-
-        err = hci_vs_write_adv_tx_power(20);
-        if (err == 0) {
-            int8_t eff;
-            if (hci_vs_read_adv_tx_power(&eff) == 0) {
-                LOG_INF("[HCI] ADV TX set=20 dBm, effective=%d dBm%s",
-                        eff, (eff > 8) ? "  <-- FEM-updated" : "");
-            } else {
-                LOG_ERR("[HCI] READ adv TX failed");
-            }
-        } else {
-            LOG_ERR("[HCI] WRITE adv TX(20) failed (%d)", err);
-        }
-    } else {
-        LOG_WRN("[ADV] bt_le_adv_start failed (err %d), retry", err);
-        k_work_reschedule(&adv_restart_work, K_MSEC(300));
-    }
-}
-
-static void initiate_timeout_work_handler(struct k_work *work)
-{
-    if (atomic_get(&initiating) == 1) {
-        LOG_WRN("[INITIATE] create timeout -> cancel");
-        bt_le_create_conn_cancel();
-        atomic_set(&initiating, 0);
-        if (central_pending)
-        {
-            bt_conn_unref(central_pending);
-            central_pending = NULL;
-        }
-        scan_start_safe(300);
-    }
+    // We expect start_cloned_advertising to be called explicitly
 }
 
 /* FUNCTION DEFINITIONS */
@@ -252,22 +240,21 @@ static void scan_stop_safe(void)
 
 static void adv_start_safe(int delay_ms)
 {
-    k_work_reschedule(&adv_restart_work, K_MSEC(delay_ms));
+    // Not using legacy adv start anymore for the relay logic
+    // But keeping it as placeholder if needed
 }
 
 static void adv_stop_safe(void)
 {
-    int err = bt_le_adv_stop();
-
-    if (err == -EALREADY) {
-        atomic_set(&adv_on, 0);
-        return;
-    }
-
-    if (!err) {
-        atomic_set(&adv_on, 0);
+    if (adv) {
+        int err = bt_le_ext_adv_stop(adv);
+        if (!err) {
+            atomic_set(&adv_on, 0);
+            LOG_INF("[ADV] Extended Advertising Stopped");
+        }
     } else {
-        LOG_WRN("[ADV] bt_le_adv_stop failed (err %d)", err);
+        bt_le_adv_stop(); // Fallback
+        atomic_set(&adv_on, 0);
     }
 }
 
@@ -282,8 +269,8 @@ static int hci_vs_write_adv_tx_power(int8_t tx_dbm)
     }
 
     cp = net_buf_add(buf, sizeof(*cp));
-    cp->handle_type    = BT_HCI_VS_LL_HANDLE_TYPE_ADV; /* 광고 세트 */
-    cp->handle         = sys_cpu_to_le16(0);           /* set #0 (legacy adv) */
+    cp->handle_type    = BT_HCI_VS_LL_HANDLE_TYPE_ADV;
+    cp->handle         = sys_cpu_to_le16(0);
     cp->tx_power_level = tx_dbm;
 
     int err = bt_hci_cmd_send_sync(BT_HCI_OP_VS_WRITE_TX_POWER_LEVEL, buf, &rsp);
@@ -339,9 +326,7 @@ static void scan_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t typ
     }
 
     bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-    // LOG_DBG("[DEVICE]: %s (RSSI %d)", addr_str, rssi);
 
-    /* for debugging: 이름 매칭 */
     struct adv_match_ctx ctx = {0};
 
     if (ad && ad->len) {
@@ -359,10 +344,15 @@ static void scan_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t typ
 
     LOG_INF("[MATCH] name=\"%s\" from %s (RSSI %d)", ctx.found_name, addr_str, rssi);
 
+    /* Capture Data for Cloning */
+    memcpy(captured_name, ctx.found_name, sizeof(captured_name));
+    captured_uuid_count = ctx.uuid_count;
+    for(int i=0; i<ctx.uuid_count; i++) {
+        memcpy(&captured_uuids[i], &ctx.uuids[i], sizeof(struct bt_uuid_128));
+    }
+
     scan_stop_safe();
     atomic_set(&initiating, 1);
-    initiate_start_ms = k_uptime_get_32();
-    // k_work_reschedule(&initiating_timeout_work, K_SECONDS(10));
 
     err = bt_conn_le_create(addr,
                             BT_CONN_LE_CREATE_CONN,
@@ -402,7 +392,20 @@ static bool ad_parse_cb (struct bt_data * data, void *user_data)
 
         if (strcmp(ctx->found_name, target_peripheral_name) == 0) {
             ctx->name_match = true;
-            LOG_DBG("[AD] matched device name: %s", ctx->found_name);
+            // LOG_DBG("[AD] matched device name: %s", ctx->found_name);
+        }
+        break;
+    }
+    case BT_DATA_UUID128_ALL:
+    case BT_DATA_UUID128_SOME: {
+        // Capture UUIDs (limit to 5)
+        int count = data->data_len / 16;
+        for (int i = 0; i < count && ctx->uuid_count < 5; i++) {
+            struct bt_uuid_128 *u = (struct bt_uuid_128 *)&ctx->uuids[ctx->uuid_count];
+            // Initialize the UUID structure properly
+            u->uuid.type = BT_UUID_TYPE_128;
+            memcpy(u->val, data->data + (i * 16), 16);
+            ctx->uuid_count++;
         }
         break;
     }
@@ -420,6 +423,10 @@ static uint8_t discover_func(struct bt_conn *conn,
     if (!attr) {
         LOG_INF("[DISCOVER] type %u complete", params->type);
         memset(params, 0, sizeof(*params));   /* 이 discover 작업은 끝 */
+
+        /* Discovery Finished - Start Cloning Advertising */
+        start_cloned_advertising();
+
         return BT_GATT_ITER_STOP;
     }
 
@@ -429,30 +436,41 @@ static uint8_t discover_func(struct bt_conn *conn,
         uint16_t decl_handle  = attr->handle;          /* Characteristic Declaration */
         uint16_t value_handle = chrc->value_handle;    /* Characteristic Value */
 
-        LOG_DBG("[DISCOVER] char decl=0x%04x val=0x%04x props=0x%02x",
-                decl_handle, value_handle, chrc->properties);
+        // LOG_DBG("[DISCOVER] char decl=0x%04x val=0x%04x props=0x%02x", decl_handle, value_handle, chrc->properties);
 
-        /* 2-1) Notify 지원하는 Characteristic 인가? */
+        /* Capture Write Handles */
+        if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_RAWDATA)) {
+            h_remote_write_rawdata = value_handle; // For writing
+            h_remote_rawdata = value_handle;       // For notification check
+            LOG_INF("[DISCOVER] found INFERENCE_RAWDATA (Write/Notif) at 0x%04x", value_handle);
+        }
+        else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_FILE_TRANSFER)) {
+            h_remote_file_transfer = value_handle;
+            LOG_INF("[DISCOVER] found FILE_TRANSFER (Write) at 0x%04x", value_handle);
+        }
+        else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_DEVICE_NAME)) {
+            h_remote_device_name = value_handle;
+            LOG_INF("[DISCOVER] found DEVICE_NAME (Write) at 0x%04x", value_handle);
+        }
+        else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_LOCATION)) {
+            h_remote_location = value_handle;
+            LOG_INF("[DISCOVER] found LOCATION (Write) at 0x%04x", value_handle);
+        }
+        else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_GRIDEYE_PREDICTION)) {
+            h_remote_grideye_prediction = value_handle;
+            LOG_INF("[DISCOVER] found GRIDEYE_PREDICTION (Write) at 0x%04x", value_handle);
+        }
+        else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_SEQ_ANAL_RESULT)) {
+            h_remote_seq_result = value_handle;
+            LOG_INF("[DISCOVER] found SEQ_ANAL_RESULT at 0x%04x", value_handle);
+        }
+        else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_DEBUG_STRING)) {
+            h_remote_debug_string = value_handle;
+            LOG_INF("[DISCOVER] found DEBUG_STRING at 0x%04x", value_handle);
+        }
+
+        /* Subscribe to Notifications */
         if (chrc->properties & BT_GATT_CHRC_NOTIFY) {
-
-            if (chrc->properties & BT_GATT_CHRC_NOTIFY)
-            {
-                if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_RAWDATA))
-                {
-                    h_remote_rawdata = value_handle;
-                    LOG_INF("[DISCOVER] found INFERENCE_RAWDATA char at 0x%04x", value_handle);
-                }
-                else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_SEQ_ANAL_RESULT))
-                {
-                    h_remote_seq_result = value_handle;
-                    LOG_INF("[DISCOVER] found INFERENCE_SEQ_ANAL_RESULT char at 0x%04x", value_handle);
-                }
-                else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_DEBUG_STRING))
-                {
-                    h_remote_debug_string = value_handle;
-                    LOG_INF("[DISCOVER] found INFERENCE_DEBUG_STRING char at 0x%04x", value_handle);
-                }
-            }
 
             if (subs_cnt >= MAX_SUBS) {
                 LOG_WRN("[DISCOVER] subscribe table full, skip");
@@ -474,8 +492,7 @@ static uint8_t discover_func(struct bt_conn *conn,
                         sub->value_handle, sub->ccc_handle, err);
                 memset(sub, 0, sizeof(*sub));
             } else {
-                LOG_INF("[DISCOVER] subscribed: val=0x%04x ccc=0x%04x (idx=%u)",
-                        sub->value_handle, sub->ccc_handle, (unsigned)subs_cnt);
+                // LOG_INF("[DISCOVER] subscribed: val=0x%04x ccc=0x%04x (idx=%u)", sub->value_handle, sub->ccc_handle, (unsigned)subs_cnt);
                 subs_cnt++;
             }
         }
@@ -483,9 +500,6 @@ static uint8_t discover_func(struct bt_conn *conn,
         return BT_GATT_ITER_CONTINUE;
     }
 
-    /* 지금은 다른 type 을 쓰지 않지만, 확장 대비 */
-    LOG_DBG("[DISCOVER] unsupported discover type=%u at handle=0x%04x",
-            params->type, attr->handle);
     return BT_GATT_ITER_CONTINUE;
 }
 
@@ -495,9 +509,6 @@ static int start_discovery(struct bt_conn *conn)
 
     memset(&discover_params, 0, sizeof(discover_params));
 
-    /* 서비스 UUID를 모른다는 가정 → ATT 전체 범위에서
-     * 모든 Characteristic 을 한 번 훑는다.
-     */
     discover_params.uuid         = NULL; /* 모든 캐릭터리스틱 */
     discover_params.func         = discover_func;
     discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
@@ -551,24 +562,6 @@ static uint8_t generic_notify_cb(struct bt_conn *conn,
             LOG_WRN("[RELAY] INFERENCE_DEBUG_STRING send failed (err %d)", err);
         }
     }
-    else 
-    {
-        LOG_WRN("[NOTIFY] Unknown handle=0x%04x len=%u", handle, length);
-    }
-
-    // const uint8_t *p = data;
-    // char buf[128];
-    // int off = 0;
-
-    // off += snprintk(buf + off, sizeof(buf) - off,
-    //                 "[NOTIFY] handle=%u len=%u data=",
-    //                 params->value_handle, length);
-
-    // for (uint16_t i = 0; i < length && off < (int)sizeof(buf) - 3; i++) {
-    //     off += snprintk(buf + off, sizeof(buf) - off, "%02X ", p[i]);
-    // }
-
-    // LOG_INF("%s", buf);
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -610,7 +603,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 
             /* 광고 다시 */
             atomic_set(&adv_on, 0);
-            adv_start_safe(300);
+            start_cloned_advertising();
             return;
         }
     }
@@ -630,17 +623,16 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
                 central_conn = bt_conn_ref(conn);
             }
 
+            LOG_INF("[CONNECTED] Connection established as CENTRAL to peripheral %s", addr);
+
+            // Start Discovery immediately
             err = start_discovery(central_conn);
             if (err) {
                 LOG_WRN("[CONNECTED] start discovery error : %d", err);
                 bt_conn_disconnect(central_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
             }
-            else {
-                LOG_INF("[CONNECTED] Connection established as CENTRAL to peripheral %s", addr);
-            }
 
             atomic_set(&initiating, 0);
-            LOG_INF("[CONNECTED] New peripheral device connected : %s", addr);
         }
         else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
             /* relay node 가 PERIPHERAL 로서 SLIMHUB 에 붙은 상황 */
@@ -653,12 +645,6 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
             atomic_set(&adv_on, 0);
         }
     }
-
-    LOG_INF("[CONNECTED] Connected: %s (role=%s)",
-            addr,
-            (info.role == BT_CONN_ROLE_CENTRAL) ? "CENTRAL" : "PERIPHERAL");
-
-    atomic_set(&initiating, 0);
 }
 
 
@@ -678,7 +664,6 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
         bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
         LOG_INF("[DISCONNECTED] Disconnected from %s (reason %u), but get_info failed (%d)",
                 addr, reason, err);
-        /* 여기서 conn 은 Zephyr 스택이 관리하는 포인터이므로 우리가 unref 하지 않음 */
         return;
     }
 
@@ -694,10 +679,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
             peripheral_conn = NULL;
         }
 
-        /* 필요하면 inference_svr 의 notify enable 플래그들 초기화 (옵션) */
-
         atomic_set(&adv_on, 0);
-        adv_start_safe(300);
+        start_cloned_advertising();
     }
     else if (info.role == BT_CONN_ROLE_CENTRAL) {
         /* relay node 가 CENTRAL 로서 DEAN node 에 붙어 있던 연결이 끊어진 경우 */
@@ -714,25 +697,18 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
         }
 
         atomic_set(&initiating, 0);
-
-        /* 구독 정보도 새 연결을 위해 정리 */
         memset(subs, 0, sizeof(subs));
         subs_cnt = 0;
 
+        // Reset advertising stop logic if we lost connection to DEAN?
+        // Requirement says "Boot: Start Scanning ONLY. Do NOT start advertising yet."
+        // So if we lose DEAN, we should stop advertising and scan for DEAN again.
+        adv_stop_safe();
+
         atomic_set(&scan_on, 0);
         scan_start_safe(300);
-    } else {
-        LOG_INF("[DISCONNECTED] Disconnected from %s (reason %u), unknown role=%d",
-                addr, reason, info.role);
     }
-
-    /* ⚠️ 여기서 bt_conn_unref(conn)을 호출하지 않는다!
-     * 우리가 ref를 잡은 포인터(central_conn, central_pending, peripheral_conn)에 대해서만
-     * 위에서 unref 했으므로, conn 포인터는 Zephyr 스택이 알아서 정리한다.
-     */
 }
-
-
 
 /* External Called function*/
 int ble_relay_control_start(void)
@@ -752,7 +728,139 @@ int ble_relay_control_start(void)
         k_sleep(K_MSEC(500));
     }
 
-    adv_start_safe(0);
+    /* Schedule the reset work to start multi-role logic */
+    k_work_reschedule(&reset_work, K_NO_WAIT);
 
+    return err;
+}
+
+/* New Logic: Cloned Advertising */
+static void start_cloned_advertising(void)
+{
+    int err;
+    if (atomic_get(&adv_on)) {
+        return;
+    }
+
+    LOG_INF("[ADV] Starting Cloned Advertising...");
+
+    /* Create Dynamic Data */
+    struct bt_data ad_data[2];
+    int ad_len = 0;
+
+    /* Flags */
+    ad_data[ad_len].type = BT_DATA_FLAGS;
+    ad_data[ad_len].data_len = 1;
+    static uint8_t flags = (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR);
+    ad_data[ad_len].data = &flags;
+    ad_len++;
+
+    /* Name */
+    if (strlen(captured_name) > 0) {
+        ad_data[ad_len].type = BT_DATA_NAME_COMPLETE;
+        ad_data[ad_len].data_len = strlen(captured_name);
+        ad_data[ad_len].data = (uint8_t *)captured_name;
+        ad_len++;
+    } else {
+        // Fallback
+        ad_data[ad_len].type = BT_DATA_NAME_COMPLETE;
+        ad_data[ad_len].data_len = strlen("DE&N_RELAY");
+        ad_data[ad_len].data = (uint8_t *)"DE&N_RELAY";
+        ad_len++;
+    }
+
+    /* Scan Response Data (UUIDs) */
+    struct bt_data sd_data[1];
+    int sd_len = 0;
+
+    if (captured_uuid_count > 0) {
+        sd_data[sd_len].type = BT_DATA_UUID128_ALL;
+        sd_data[sd_len].data_len = captured_uuid_count * 16;
+        sd_data[sd_len].data = (uint8_t *)captured_uuids;
+        sd_len++;
+    } else {
+        // Fallback
+        sd_data[sd_len].type = BT_DATA_UUID128_ALL;
+        sd_data[sd_len].data_len = 16;
+        sd_data[sd_len].data = (uint8_t *)BT_UUID_BASE_SERVICE_VAL;
+        sd_len++;
+    }
+
+    /* Use Extended Advertising */
+    if (!adv) {
+        struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(
+            BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
+            BT_GAP_ADV_FAST_INT_MIN_2,
+            BT_GAP_ADV_FAST_INT_MAX_2,
+            NULL);
+
+        err = bt_le_ext_adv_create(&param, NULL, &adv);
+        if (err) {
+            LOG_ERR("Failed to create advertiser (err %d)", err);
+            return;
+        }
+    }
+
+    err = bt_le_ext_adv_set_data(adv, ad_data, ad_len, sd_data, sd_len);
+    if (err) {
+        LOG_ERR("Failed to set adv data (err %d)", err);
+        return;
+    }
+
+    err = bt_le_ext_adv_start(adv, BT_LE_EXT_ADV_START_DEFAULT);
+    if (err) {
+        LOG_ERR("Failed to start adv (err %d)", err);
+        return;
+    }
+
+    atomic_set(&adv_on, 1);
+    LOG_INF("[ADV] Started mimicking: %s", captured_name);
+}
+
+/* Helper to Forward Writes */
+int ble_relay_send_write_to_dean(const struct bt_uuid *uuid, const void *data, uint16_t len)
+{
+    if (!central_conn) {
+        LOG_WRN("[RELAY] No connection to DEAN");
+        return -ENOTCONN;
+    }
+
+    uint16_t handle = 0;
+
+    if (!bt_uuid_cmp(uuid, BT_UUID_CHRC_INFERENCE_RAWDATA)) {
+        handle = h_remote_write_rawdata;
+    } else if (!bt_uuid_cmp(uuid, BT_UUID_CHRC_FILE_TRANSFER)) {
+        handle = h_remote_file_transfer;
+    } else if (!bt_uuid_cmp(uuid, BT_UUID_CHRC_DEVICE_NAME)) {
+        handle = h_remote_device_name;
+    } else if (!bt_uuid_cmp(uuid, BT_UUID_CHRC_LOCATION)) {
+        handle = h_remote_location;
+    } else if (!bt_uuid_cmp(uuid, BT_UUID_CHRC_GRIDEYE_PREDICTION)) {
+        handle = h_remote_grideye_prediction;
+    }
+
+    if (handle == 0) {
+        LOG_WRN("[RELAY] Handle not found for UUID");
+        return -EINVAL;
+    }
+
+    // Use Write Without Response for speed, or Write Response if needed.
+    // Assuming Write Without Response for high throughput relaying unless confirmed otherwise.
+    // However, for Config/Control, Write With Response is safer.
+    // Let's use Write Request (default) to ensure it reaches DEAN.
+
+    // Note: To use Write Without Response, we need to check properties.
+    // For safety in this general function, we can try `bt_gatt_write_without_response`
+    // and if it fails, fallback? Or just use `bt_gatt_write`.
+
+    // Simpler approach: Just use Write Without Response as it's a relay.
+    // If Ack is needed, SLIMHUB will handle app-level ack.
+
+    int err = bt_gatt_write_without_response(central_conn, handle, data, len, false);
+    if (err) {
+        LOG_WRN("[RELAY] Write failed (err %d) handle=0x%04x", err, handle);
+    } else {
+        LOG_DBG("[RELAY] Forwarded %d bytes to handle 0x%04x", len, handle);
+    }
     return err;
 }
