@@ -23,6 +23,7 @@
 // #include "inference.h"
 // #include "inference_msgq.h"
 #include "inference_service.h"
+#include "ble_relay_control.h"
 
 static bool inference_rawdata_notify_enabled;
 static bool inference_seq_anal_result_notify_enabled;
@@ -79,7 +80,11 @@ static bt_gatt_attr_write_func_t unitspace_existence_estimation_write_cb(struct 
                                                 uint16_t offset,
                                                 uint8_t flags)
 {
-    unitspace_existence_estimation(buf, len);
+    // unitspace_existence_estimation(buf, len);
+
+    // Forward to DEAN
+    ble_relay_send_write_to_dean(BT_UUID_CHRC_INFERENCE_RAWDATA, buf, len);
+
     return len;
 }
 

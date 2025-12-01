@@ -6,6 +6,7 @@
  *    나머지 서비스는 "형식만 있는 stub" 으로 구현한다.
  */
 #include "relay_stub_service.h"
+#include "ble_relay_control.h"
 
 #include <string.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -98,6 +99,8 @@ static bt_gatt_attr_write_func_t name_write_cb(struct bt_conn *conn,
     memset(dean_device_conf.device_name, 0, sizeof(dean_device_conf.device_name));
     memcpy(dean_device_conf.device_name, buf, len);
 
+    ble_relay_send_write_to_dean(BT_UUID_CHRC_DEVICE_NAME, buf, len);
+
     return len;
 }
 
@@ -122,6 +125,8 @@ static bt_gatt_attr_write_func_t location_write_cb(struct bt_conn *conn,
     memset(dean_device_conf.location, 0, sizeof(dean_device_conf.location));
     memcpy(dean_device_conf.location, buf, len);
 
+    ble_relay_send_write_to_dean(BT_UUID_CHRC_LOCATION, buf, len);
+
     return len;
 }
 
@@ -134,7 +139,8 @@ static bt_gatt_attr_write_func_t file_write_cb(struct bt_conn *conn,
                                                uint16_t offset,
                                                uint8_t flags)
 {
-    process_file_transfer_write(buf, len);
+    // process_file_transfer_write(buf, len);
+    ble_relay_send_write_to_dean(BT_UUID_CHRC_FILE_TRANSFER, buf, len);
     return len;
 }
 void process_file_transfer_write(const void *buf, uint16_t len)
@@ -329,6 +335,7 @@ static bt_gatt_attr_write_func_t grideye_write_cb(struct bt_conn *conn,
                                                   uint8_t flags)
 {
     // grideye_prediction_callback(buf, len);
+    ble_relay_send_write_to_dean(BT_UUID_CHRC_GRIDEYE_PREDICTION, buf, len);
     return len;
 }
 
