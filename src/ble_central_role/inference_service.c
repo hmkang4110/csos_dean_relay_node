@@ -19,10 +19,12 @@
 #include <zephyr/kernel.h>
 #include <zephyr/kernel/thread.h>
 #include <zephyr/kernel/thread_stack.h>
+#include <zephyr/sys/util.h>
 
 // #include "inference.h"
 // #include "inference_msgq.h"
 #include "inference_service.h"
+#include "ble_relay_control.h"
 
 static bool inference_rawdata_notify_enabled;
 static bool inference_seq_anal_result_notify_enabled;
@@ -79,7 +81,9 @@ static bt_gatt_attr_write_func_t unitspace_existence_estimation_write_cb(struct 
                                                 uint16_t offset,
                                                 uint8_t flags)
 {
-    unitspace_existence_estimation(buf, len);
+    ARG_UNUSED(offset);
+    ARG_UNUSED(flags);
+    relay_route_write_to_dean(conn, attr, buf, len);
     return len;
 }
 
