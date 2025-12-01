@@ -85,7 +85,13 @@ void relay_forward_notify_from_dean(struct bt_conn *conn,
     const struct bt_gatt_attr *attr = NULL;
     int err;
 
-    if (!session || !session->conn_slimhub) {
+    if (!session) {
+        LOG_WRN("[ROUTE] notify: no session for conn");
+        return;
+    }
+
+    if (!session->conn_slimhub) {
+        LOG_DBG("[ROUTE] notify: hub not connected, dropping");
         return;
     }
 

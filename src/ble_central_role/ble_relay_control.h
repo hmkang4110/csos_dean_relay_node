@@ -12,7 +12,7 @@
 #define RELAY_MAX_UUID128  2
 #define RELAY_MAX_SERV_DATA_LEN 24
 #define RELAY_MAX_MFG_DATA_LEN  24
-#define RELAY_MAX_SUBS_PER_SESSION 3
+#define RELAY_MAX_SUBS_PER_SESSION 24
 
 #define BT_GAP_MAX_NAME_LEN 30
 
@@ -55,6 +55,9 @@ struct relay_session {
     struct bt_gatt_subscribe_params subs[RELAY_MAX_SUBS_PER_SESSION];
     size_t subs_count;
     struct bt_gatt_discover_params discover_params;
+    struct bt_gatt_discover_params ccc_discover_params;
+    struct bt_gatt_subscribe_params *pending_sub;
+    size_t ccc_next_idx;
 };
 
 extern struct relay_session g_relay_sessions[MAX_RELAY_SESSIONS];

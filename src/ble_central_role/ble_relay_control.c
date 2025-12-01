@@ -27,6 +27,8 @@ static void on_scan_match(const struct dean_adv_report *report);
 static int start_discovery(struct relay_session *session);
 static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr, struct bt_gatt_discover_params *params);
 static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *params, const void *data, uint16_t length);
+static uint8_t discover_ccc_func(struct bt_conn *conn, const struct bt_gatt_attr *attr, struct bt_gatt_discover_params *params);
+static int start_ccc_discover(struct relay_session *session);
 
 static void connected(struct bt_conn *conn, uint8_t err);
 static void disconnected(struct bt_conn *conn, uint8_t reason);
@@ -198,6 +200,8 @@ static uint8_t discover_func(struct bt_conn *conn,
                                          session->handle_dean_inference_rawdata,
                                          session->handle_dean_inference_seq_result,
                                          session->handle_dean_inference_debugstr);
+        session->ccc_next_idx = 0;
+        start_ccc_discover(session);
         return BT_GATT_ITER_STOP;
     }
 
@@ -209,33 +213,79 @@ static uint8_t discover_func(struct bt_conn *conn,
     if (chrc->properties & BT_GATT_CHRC_NOTIFY) {
         if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_RAWDATA)) {
             session->handle_dean_inference_rawdata = chrc->value_handle;
+            LOG_INF("[DISCOVER] found INFERENCE_RAWDATA char at 0x%04x", chrc->value_handle);
         } else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_SEQ_ANAL_RESULT)) {
             session->handle_dean_inference_seq_result = chrc->value_handle;
+            LOG_INF("[DISCOVER] found INFERENCE_SEQ_ANAL_RESULT char at 0x%04x", chrc->value_handle);
         } else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_DEBUG_STRING)) {
             session->handle_dean_inference_debugstr = chrc->value_handle;
+            LOG_INF("[DISCOVER] found INFERENCE_DEBUG_STRING char at 0x%04x", chrc->value_handle);
         }
 
         if (session->subs_count < RELAY_MAX_SUBS_PER_SESSION) {
             sub = &session->subs[session->subs_count];
             memset(sub, 0, sizeof(*sub));
-            /* With CONFIG_BT_GATT_AUTO_DISCOVER_CCC, set ccc_handle=0 to auto-find */
-            sub->ccc_handle = 0;
+            sub->ccc_handle = chrc->value_handle + 1;
             sub->value_handle = chrc->value_handle;
             sub->value = BT_GATT_CCC_NOTIFY;
             sub->notify = notify_cb;
 
+            /* Immediate subscribe with best-guess CCC handle, like the old code */
             int serr = bt_gatt_subscribe(conn, sub);
-            if (serr == 0 || serr == -EALREADY) {
-                session->subs_count++;
-                LOG_INF("[SESSION %d] subscribed val=0x%04x ccc=0x%04x", session->index, sub->value_handle, sub->ccc_handle);
-            } else {
+            if (serr && serr != -EALREADY) {
                 LOG_WRN("[SESSION %d] subscribe failed val=0x%04x ccc=0x%04x err=%d",
                         session->index, sub->value_handle, sub->ccc_handle, serr);
+            } else {
+                LOG_INF("[SESSION %d] subscribed (initial guess) val=0x%04x ccc=0x%04x",
+                        session->index, sub->value_handle, sub->ccc_handle);
+                /* Best-effort enable */
+                uint8_t ccc_en[2] = { 0x01, 0x00 };
+                (void)bt_gatt_write_without_response(conn, sub->ccc_handle, ccc_en, sizeof(ccc_en), false);
             }
+
+            session->subs_count++;
         }
     }
 
     return BT_GATT_ITER_CONTINUE;
+}
+
+static int start_ccc_discover(struct relay_session *session)
+{
+    if (!session) {
+        return -EINVAL;
+    }
+
+    while (session->ccc_next_idx < session->subs_count) {
+        struct bt_gatt_subscribe_params *sub = &session->subs[session->ccc_next_idx];
+
+        if (!sub->value_handle) {
+            session->ccc_next_idx++;
+            continue;
+        }
+
+        session->pending_sub = sub;
+        memset(&session->ccc_discover_params, 0, sizeof(session->ccc_discover_params));
+        session->ccc_discover_params.uuid = BT_UUID_GATT_CCC;
+        session->ccc_discover_params.func = discover_ccc_func;
+        session->ccc_discover_params.start_handle = sub->value_handle + 1;
+        session->ccc_discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+        session->ccc_discover_params.type = BT_GATT_DISCOVER_DESCRIPTOR;
+
+        int err = bt_gatt_discover(session->conn_dean, &session->ccc_discover_params);
+        if (err) {
+            LOG_WRN("[SESSION %d] CCC discover start failed idx=%zu err=%d",
+                    session->index, session->ccc_next_idx, err);
+            memset(sub, 0, sizeof(*sub));
+            session->pending_sub = NULL;
+            session->ccc_next_idx++;
+            continue;
+        }
+
+        return 0; /* discovery started */
+    }
+
+    return 0;
 }
 
 static int start_discovery(struct relay_session *session)
@@ -248,6 +298,9 @@ static int start_discovery(struct relay_session *session)
     session->handle_dean_inference_debugstr = 0;
     session->subs_count = 0;
     memset(session->subs, 0, sizeof(session->subs));
+    memset(&session->ccc_discover_params, 0, sizeof(session->ccc_discover_params));
+    session->pending_sub = NULL;
+    session->ccc_next_idx = 0;
 
     session->discover_params.uuid = NULL;
     session->discover_params.func = discover_func;
@@ -270,11 +323,55 @@ static uint8_t notify_cb(struct bt_conn *conn,
                          uint16_t length)
 {
     if (!data) {
+        LOG_INF("[NOTIFY] unsubscribed handle=0x%04x", params->value_handle);
         params->value_handle = 0U;
         return BT_GATT_ITER_STOP;
     }
 
+    LOG_DBG("[NOTIFY] from handle=0x%04x len=%u", params->value_handle, length);
     relay_forward_notify_from_dean(conn, params->value_handle, data, length);
+    return BT_GATT_ITER_CONTINUE;
+}
+
+static uint8_t discover_ccc_func(struct bt_conn *conn,
+                                 const struct bt_gatt_attr *attr,
+                                 struct bt_gatt_discover_params *params)
+{
+    struct relay_session *session = relay_mapping_by_dean_conn(conn);
+
+    if (!session || !session->pending_sub) {
+        memset(params, 0, sizeof(*params));
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (!attr) {
+        LOG_WRN("[SESSION %d] CCC descriptor not found", session->index);
+        memset(params, 0, sizeof(*params));
+        session->pending_sub = NULL;
+        session->ccc_next_idx++;
+        start_ccc_discover(session);
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (!bt_uuid_cmp(attr->uuid, BT_UUID_GATT_CCC)) {
+        session->pending_sub->ccc_handle = attr->handle;
+        int err = bt_gatt_subscribe(conn, session->pending_sub);
+        if (err && err != -EALREADY) {
+            LOG_WRN("[SESSION %d] subscribe after CCC discover failed err=%d", session->index, err);
+            memset(session->pending_sub, 0, sizeof(*session->pending_sub));
+        } else {
+            // uint8_t ccc_en[2] = { 0x01, 0x00 };
+            // (void)bt_gatt_write_without_response(conn, attr->handle, ccc_en, sizeof(ccc_en), false);
+            session->subs_count++;
+            LOG_INF("[SESSION %d] subscribed (CCC found at 0x%04x)", session->index, attr->handle);
+        }
+        session->pending_sub = NULL;
+        memset(params, 0, sizeof(*params));
+        session->ccc_next_idx++;
+        start_ccc_discover(session);
+        return BT_GATT_ITER_STOP;
+    }
+
     return BT_GATT_ITER_CONTINUE;
 }
 
