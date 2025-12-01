@@ -9,6 +9,6 @@ int central_scan_start(void);
 int central_scan_stop(void);
 int ble_relay_control_start(void);
 
-/* Helper to forward write requests to DEAN */
+/* Helper to forward write requests to DEAN */ 
 /* source_conn: The connection from SLIMHUB (used to identify the session) */
 int ble_relay_send_write_to_dean(struct bt_conn *source_conn, const struct bt_uuid *uuid, const void *data, uint16_t len);

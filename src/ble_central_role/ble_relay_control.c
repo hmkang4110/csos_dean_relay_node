@@ -149,6 +149,13 @@ static struct RelaySession* find_session_by_adv(struct bt_le_ext_adv *adv) {
     return NULL;
 }
 
+// Write handles (Upstream Relay)
+static uint16_t h_remote_write_rawdata; // For INFERENCE_RAWDATA (Write/Read/Notify)
+static uint16_t h_remote_file_transfer;
+static uint16_t h_remote_device_name;
+static uint16_t h_remote_location;
+static uint16_t h_remote_grideye_prediction;
+
 struct adv_match_ctx
 {
     bool name_match;
@@ -160,6 +167,9 @@ struct adv_match_ctx
 /* We use a temporary pointer for the currently initiating connection */
 static struct bt_conn *central_pending;
 static int pending_session_idx = -1;
+
+/* Extended Advertising Handle */
+static struct bt_le_ext_adv *adv;
 
 /* BLE CENTRAL PARAMETERS */
 #define BLE_SCAN_INTERVAL 80    /* 50 ms */
@@ -173,6 +183,7 @@ static int pending_session_idx = -1;
 #define BT_DEVICE_CONNECT_LIST_NUM  1
 
 /* BLE PERIPHERAL PARAMETERS */
+// Initial default name before cloning
 #define BLE_DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define BLE_DEVICE_NAME_LEN (sizeof(BLE_DEVICE_NAME) - 1)
 
@@ -386,6 +397,13 @@ static void scan_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t typ
     sessions[free_idx].uuid_count = ctx.uuid_count;
     for(int i=0; i<ctx.uuid_count; i++) {
         memcpy(&sessions[free_idx].captured_uuids[i], &ctx.uuids[i], sizeof(struct bt_uuid_128));
+    }
+
+    /* Capture Data for Cloning */
+    memcpy(captured_name, ctx.found_name, sizeof(captured_name));
+    captured_uuid_count = ctx.uuid_count;
+    for(int i=0; i<ctx.uuid_count; i++) {
+        memcpy(&captured_uuids[i], &ctx.uuids[i], sizeof(struct bt_uuid_128));
     }
 
     scan_stop_safe();
