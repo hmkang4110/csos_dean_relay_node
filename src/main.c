@@ -4,7 +4,6 @@
 #include "ble_relay_control.h"
 
 /* 위 파일의 프로토타입 */
-// int central_discovery_start(void);
 
 void main(void)
 {
