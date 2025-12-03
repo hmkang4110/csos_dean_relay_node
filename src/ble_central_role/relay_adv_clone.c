@@ -87,13 +87,6 @@ static size_t build_adv_payload(const struct relay_session *session,
     }
 
     if (idx < ad_cap) {
-        ad[idx].type = BT_DATA_FLAGS;
-        ad[idx].data_len = 1;
-        ad[idx].data = (uint8_t[]){ BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR };
-        idx++;
-    }
-
-    if (idx < ad_cap) {
         ad[idx].type = BT_DATA_NAME_COMPLETE;
         ad[idx].data_len = strlen(name);
         ad[idx].data = (const uint8_t *)name;
@@ -147,6 +140,9 @@ int relay_adv_clone_start(struct relay_session *session)
     struct bt_data ad[7];
     bt_addr_le_t ids[CONFIG_BT_ID_MAX];
     size_t id_count = ARRAY_SIZE(ids);
+    char addr_str[BT_ADDR_LE_STR_LEN] = {0};
+    char uuid_buf[40] = {0};
+    struct bt_le_ext_adv_info adv_info;
 
     if (!session) {
         return -EINVAL;
@@ -160,29 +156,56 @@ int relay_adv_clone_start(struct relay_session *session)
         return err;
     }
 
-    /* Try to create a fresh identity; if pool is full, reuse an existing one. */
-    session->adv_id = bt_id_create(NULL, NULL);
+    /* Try to create a fresh identity using the DEAN MAC when possible. */
+    bt_addr_le_t *addr = (bt_addr_le_t *)&session->adv_report.addr;
+    const bool addr_is_rpa = bt_addr_le_is_rpa(addr);
+    const bool addr_is_static = (addr->type == BT_ADDR_LE_RANDOM) &&
+                                ((addr->a.val[5] & 0xC0) == 0xC0);
+
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+
+    /* Check if identity already exists for this MAC */
+    if (!addr_is_rpa && addr_is_static) {
+        bt_addr_le_t known_addrs[CONFIG_BT_ID_MAX];
+        size_t known_cnt = ARRAY_SIZE(known_addrs);
+        bt_id_get(known_addrs, &known_cnt);
+        for (size_t i = 0; i < known_cnt; i++) {
+            if (bt_addr_le_cmp(&known_addrs[i], addr) == 0) {
+                session->adv_id = (int)i;
+                LOG_INF("[ADV] found existing id=%d for DEAN MAC (%s)", session->adv_id, addr_str);
+                break;
+            }
+        }
+    }
+
+    if (session->adv_id < 0) {
+        session->adv_id = bt_id_create((addr_is_rpa || !addr_is_static) ? NULL : addr, NULL);
+        if (session->adv_id == -EINVAL && addr_is_static) {
+            /* Controller/stack may refuse cloning into a new id; retry with NULL. */
+            session->adv_id = bt_id_create(NULL, NULL);
+        }
+    }
+
     if (session->adv_id == -ENOMEM) {
         bt_id_get(ids, &id_count);
-        if (id_count == 0) {
+        if (id_count <= 1) {
             LOG_ERR("[ADV] no identities available");
             return -ENOMEM;
         }
-        session->adv_id = (int)(session->index % id_count);
+        /* avoid BT_ID_DEFAULT (0) since bt_id_reset forbids it */
+        session->adv_id = 1 + (session->index % (id_count - 1));
         LOG_WRN("[ADV] identity pool full, reuse id=%d", session->adv_id);
-    } else if (session->adv_id >= 0) {
-        bt_addr_le_t *addr = (bt_addr_le_t *)&session->adv_report.addr;
-        if (!bt_addr_le_is_rpa(addr)) {
-            int rerr = bt_id_reset((uint8_t)session->adv_id, addr, NULL);
-            if (rerr) {
-                LOG_WRN("[ADV] id_reset to clone MAC failed (%d)", rerr);
-            }
-        } else {
-            LOG_WRN("[ADV] target addr is RPA; cannot clone MAC safely");
-        }
     } else if (session->adv_id < 0) {
         LOG_ERR("[ADV] identity create failed (%d)", session->adv_id);
         return session->adv_id;
+    }
+
+    if (!addr_is_rpa && addr_is_static && session->adv_id != BT_ID_DEFAULT) {
+        /* Do not reset if already present; just use existing identity */
+        LOG_INF("[ADV] id=%d matches DEAN MAC (%s), use identity as-is",
+                session->adv_id, addr_str);
+    } else if (addr_is_rpa || !addr_is_static) {
+        LOG_WRN("[ADV] target addr not cloneable; using relay identity");
     }
 
     struct bt_le_adv_param adv_param = {
@@ -191,6 +214,7 @@ int relay_adv_clone_start(struct relay_session *session)
         .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
         .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
         .options = BT_LE_ADV_OPT_EXT_ADV |
+                //    BT_LE_ADV_OPT_NO_2M |      /* keep secondary on 1M for BlueZ/Bleak */
                    BT_LE_ADV_OPT_CONNECTABLE,
     };
 
@@ -200,7 +224,30 @@ int relay_adv_clone_start(struct relay_session *session)
         return err;
     }
 
+    /* Log the effective advertising address chosen by the controller for this set */
+    if (bt_le_ext_adv_get_info(session->adv, &adv_info) == 0) {
+        bt_addr_le_to_str(&adv_info.addr, addr_str, sizeof(addr_str));
+        LOG_INF("[ADV] adv set=%p id=%d address on-air: %s", session->adv, session->adv_id, addr_str);
+    } else {
+        LOG_WRN("[ADV] failed to read adv address for set=%p", session->adv);
+    }
+
     size_t ad_len = build_adv_payload(session, ad, ARRAY_SIZE(ad));
+    /* Log first 128-bit UUID, if present */
+    if (session->adv_report.uuid128_count > 0) {
+        bin2hex((const uint8_t *)session->adv_report.uuid128[0], 16, uuid_buf, sizeof(uuid_buf));
+        LOG_INF("[ADV] UUID128[0]=%s", uuid_buf);
+    } else {
+        LOG_INF("[ADV] UUID128[0]=<fallback or none>");
+    }
+
+    LOG_INF("[ADV] setting data: len=%zu name=\"%s\" svc16_cnt=%zu svc128_cnt=%zu mfg_len=%zu",
+            ad_len,
+            session->adv_report.name[0] ? session->adv_report.name : "DE&N",
+            session->adv_report.uuid16_count,
+            session->adv_report.uuid128_count,
+            session->adv_report.mfg_data_len);
+
     err = bt_le_ext_adv_set_data(session->adv, ad, ad_len, NULL, 0);
     if (err) {
         LOG_ERR("[ADV] set data failed (%d) len=%zu name_len=%zu svc_len=%zu mfg_len=%zu",
@@ -229,7 +276,8 @@ int relay_adv_clone_start(struct relay_session *session)
         return err;
     }
 
-    LOG_INF("[ADV] proxy adv started for session %d as %s", session->index, session->adv_report.name);
+    LOG_INF("[ADV] proxy adv started for session %d as %s", 
+        session->index, session->adv_report.name);
     return 0;
 }
 

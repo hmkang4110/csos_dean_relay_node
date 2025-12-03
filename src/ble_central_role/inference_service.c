@@ -95,13 +95,13 @@ BT_GATT_SERVICE_DEFINE(
                             BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY | BT_GATT_CHRC_WRITE,
                             BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
                             NULL, unitspace_existence_estimation_write_cb, NULL),
-    BT_GATT_CCC(ccc_cfg_inference_seq_anal_result_changed,
+    BT_GATT_CCC(ccc_cfg_inference_rawdata_changed,
                             BT_GATT_PERM_READ | BT_GATT_PERM_WRITE), 
     BT_GATT_CHARACTERISTIC( BT_UUID_CHRC_INFERENCE_SEQ_ANAL_RESULT,
                             BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
                             BT_GATT_PERM_READ,
                             NULL, NULL, NULL),   
-    BT_GATT_CCC(ccc_cfg_inference_rawdata_changed,
+    BT_GATT_CCC(ccc_cfg_inference_seq_anal_result_changed,
                             BT_GATT_PERM_READ | BT_GATT_PERM_WRITE), 
     BT_GATT_CHARACTERISTIC( BT_UUID_CHRC_INFERENCE_DEBUG_STRING,
                             BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
@@ -132,7 +132,7 @@ int bt_inference_rawdata_send(uint8_t *packet_arr)
 int bt_inference_seq_anal_result_send(char *result_char_arr, uint16_t result_len_uint16_t)
 {
     int err = 0;
-    if (!inference_rawdata_notify_enabled)
+    if (!inference_seq_anal_result_notify_enabled)
     {
         return -EACCES;
     }
