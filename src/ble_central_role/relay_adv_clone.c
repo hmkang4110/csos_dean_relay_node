@@ -73,9 +73,10 @@ static size_t build_adv_payload(const struct relay_session *session,
                                 size_t ad_cap)
 {
     size_t idx = 0;
-    const uint8_t *uuid128_data = (const uint8_t *)session->adv_report.uuid128;
-    size_t uuid128_len = session->adv_report.uuid128_count * 16;
-    uint8_t uuid128_type = session->adv_report.uuid128_type ? session->adv_report.uuid128_type : BT_DATA_UUID128_ALL;
+    const struct bt_uuid_128 *inf = (const struct bt_uuid_128 *)BT_UUID_INFERENCE_SERVICE;
+    const uint8_t *uuid128_data = inf->val;
+    size_t uuid128_len = 16;
+    uint8_t uuid128_type = BT_DATA_UUID128_ALL;
     const char *name = session->adv_report.name[0] ? session->adv_report.name : "DE&N";
 
     /* Fallback: ensure primary service UUID is present for scanners like bleak */
@@ -214,7 +215,7 @@ int relay_adv_clone_start(struct relay_session *session)
         .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
         .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
         .options = BT_LE_ADV_OPT_EXT_ADV |
-                //    BT_LE_ADV_OPT_NO_2M |      /* keep secondary on 1M for BlueZ/Bleak */
+                   BT_LE_ADV_OPT_NO_2M |
                    BT_LE_ADV_OPT_CONNECTABLE,
     };
 
