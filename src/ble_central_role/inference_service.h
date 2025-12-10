@@ -69,7 +69,7 @@
  * @param result_arr is the raw format of the MSGQ packet. It's size is various according to the MSGQ type.
  * @return int  
  */
-int bt_inference_rawdata_send(uint8_t *packet_arr);
+int bt_inference_rawdata_send(uint8_t *packet_arr, uint16_t packet_len_uint16_t);
 
 /** 
  * @brief Send Inference Result.

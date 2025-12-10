@@ -23,6 +23,7 @@
 // #include "inference.h"
 // #include "inference_msgq.h"
 #include "inference_service.h"
+#include "ble_relay_control.h"
 
 static bool inference_rawdata_notify_enabled;
 static bool inference_seq_anal_result_notify_enabled;
@@ -79,7 +80,24 @@ static bt_gatt_attr_write_func_t unitspace_existence_estimation_write_cb(struct 
                                                 uint16_t offset,
                                                 uint8_t flags)
 {
-    unitspace_existence_estimation(buf, len);
+    ARG_UNUSED(attr);
+    ARG_UNUSED(offset);
+    ARG_UNUSED(flags);
+
+    if (len < 6) {
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+    }
+
+    const uint8_t *mac = buf;
+    const uint8_t *payload = mac + 6;
+    uint16_t payload_len = len - 6;
+
+    int err = relay_forward_rawdata_to_dean(mac, payload, payload_len);
+    if (err) {
+        return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+    }
+
+    unitspace_existence_estimation(payload, payload_len);
     return len;
 }
 
@@ -91,13 +109,13 @@ BT_GATT_SERVICE_DEFINE(
                             BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY | BT_GATT_CHRC_WRITE,
                             BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
                             NULL, unitspace_existence_estimation_write_cb, NULL),
-    BT_GATT_CCC(ccc_cfg_inference_seq_anal_result_changed,
+    BT_GATT_CCC(ccc_cfg_inference_rawdata_changed,
                             BT_GATT_PERM_READ | BT_GATT_PERM_WRITE), 
     BT_GATT_CHARACTERISTIC( BT_UUID_CHRC_INFERENCE_SEQ_ANAL_RESULT,
                             BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
                             BT_GATT_PERM_READ,
                             NULL, NULL, NULL),   
-    BT_GATT_CCC(ccc_cfg_inference_rawdata_changed,
+    BT_GATT_CCC(ccc_cfg_inference_seq_anal_result_changed,
                             BT_GATT_PERM_READ | BT_GATT_PERM_WRITE), 
     BT_GATT_CHARACTERISTIC( BT_UUID_CHRC_INFERENCE_DEBUG_STRING,
                             BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
@@ -108,7 +126,7 @@ BT_GATT_SERVICE_DEFINE(
     );
 
 
-int bt_inference_rawdata_send(uint8_t *packet_arr)
+int bt_inference_rawdata_send(uint8_t *packet_arr, uint16_t packet_len_uint16_t)
 {
     int err = 0;
 
@@ -120,7 +138,7 @@ int bt_inference_rawdata_send(uint8_t *packet_arr)
     
     err = bt_gatt_notify(NULL, &inference_svr.attrs[2],
                   packet_arr,
-                  INFERENCE_RESULT_PACKET_SIZE);
+                  packet_len_uint16_t);
 
     return err;
 }
@@ -128,7 +146,7 @@ int bt_inference_rawdata_send(uint8_t *packet_arr)
 int bt_inference_seq_anal_result_send(char *result_char_arr, uint16_t result_len_uint16_t)
 {
     int err = 0;
-    if (!inference_rawdata_notify_enabled)
+    if (!inference_seq_anal_result_notify_enabled)
     {
         return -EACCES;
     }
