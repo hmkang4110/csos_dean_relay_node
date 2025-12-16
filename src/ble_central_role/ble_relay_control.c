@@ -67,6 +67,7 @@ static bool ad_parse_cb (struct bt_data * data, void *user_data);
 static int hci_vs_write_adv_tx_power(int8_t tx_dbm);
 static int hci_vs_read_adv_tx_power(int8_t *out_dbm);
 static uint8_t generic_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *params, const void *data, uint16_t length);
+static void mtu_exchanged_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_exchange_params *params);
 static void connected(struct bt_conn *conn, uint8_t err);
 static void disconnected(struct bt_conn *conn, uint8_t reason);
 static void forward_write_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_write_params *params);
@@ -121,6 +122,7 @@ static struct relay_route_entry routing_table[ROUTING_TABLE_SIZE];
 struct dean_link
 {
     struct bt_conn *conn;
+    struct bt_gatt_exchange_params mtu_params;
     struct bt_gatt_discover_params discover_params;
     struct bt_gatt_subscribe_params subs[MAX_SUBS_PER_CONN];
     struct bt_gatt_write_params write_params;
@@ -766,6 +768,7 @@ static uint8_t discover_func(struct bt_conn *conn,
         const struct bt_gatt_chrc *chrc = attr->user_data;
         uint16_t decl_handle  = attr->handle;          /* Characteristic Declaration */
         uint16_t value_handle = chrc->value_handle;    /* Characteristic Value */
+        const char *inf_name = NULL;
 
         /* LOG_DBG("[DISCOVER] char decl=0x%04x val=0x%04x props=0x%02x",
                    decl_handle, value_handle, chrc->properties); */
@@ -775,14 +778,17 @@ static uint8_t discover_func(struct bt_conn *conn,
 
             if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_RAWDATA))
             {
+                inf_name = "INFERENCE_RAWDATA";
                 routing_update_handle(conn, RELAY_CHAR_RAWDATA, value_handle);
             }
             else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_SEQ_ANAL_RESULT))
             {
+                inf_name = "INFERENCE_SEQ_RESULT";
                 routing_update_handle(conn, RELAY_CHAR_SEQ_RESULT, value_handle);
             }
             else if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_INFERENCE_DEBUG_STRING))
             {
+                inf_name = "INFERENCE_DEBUG_STR";
                 routing_update_handle(conn, RELAY_CHAR_DEBUG_STRING, value_handle);
             }
 
@@ -800,7 +806,12 @@ static uint8_t discover_func(struct bt_conn *conn,
             }
 
             if (!sub) {
-                LOG_WRN("[DISCOVER] subscribe table full, skip");
+                if (inf_name) {
+                    LOG_WRN("[DISCOVER] %s subscribe skipped: table full (val=0x%04x)",
+                            inf_name, value_handle);
+                } else {
+                    LOG_WRN("[DISCOVER] subscribe table full, skip");
+                }
                 return BT_GATT_ITER_CONTINUE;
             }
 
@@ -812,11 +823,19 @@ static uint8_t discover_func(struct bt_conn *conn,
             sub->value        = BT_GATT_CCC_NOTIFY;
             sub->notify       = generic_notify_cb;
 
+            if (inf_name) {
+                LOG_INF("[SUB] %s subscribe attempt val=0x%04x ccc=0x%04x decl=0x%04x",
+                        inf_name, sub->value_handle, sub->ccc_handle, decl_handle);
+            }
+
             int err = bt_gatt_subscribe(conn, sub);
             if (err && err != -EALREADY) {
                 LOG_WRN("[DISCOVER] subscribe failed: val=0x%04x ccc=0x%04x err=%d",
                         sub->value_handle, sub->ccc_handle, err);
                 memset(sub, 0, sizeof(*sub));
+            } else if (inf_name) {
+                LOG_INF("[SUB] %s subscribe ok (err=%d) val=0x%04x ccc=0x%04x",
+                        inf_name, err, sub->value_handle, sub->ccc_handle);
             } else {
                 /* subscription succeeded */
             }
@@ -926,7 +945,9 @@ static uint8_t generic_notify_cb(struct bt_conn *conn,
     }
     else if (entry && entry->h_debug_string && handle == entry->h_debug_string)
     {
+        LOG_INF("[NOTIFY] INFERENCE_DEBUG_STR from conn handle=0x%04x len=%u", handle, length);
         if (!is_inference_debug_string_notify_enabled()) {
+            LOG_INF("[NOTIFY] drop INFERENCE_DEBUG_STR forward: SLIMHUB CCC disabled");
             return BT_GATT_ITER_CONTINUE;
         }
         err = bt_inference_debug_string_send((uint8_t *)data, length);
@@ -955,6 +976,23 @@ static uint8_t generic_notify_cb(struct bt_conn *conn,
     // LOG_INF("%s", buf);
 
     return BT_GATT_ITER_CONTINUE;
+}
+
+static void mtu_exchanged_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_exchange_params *params)
+{
+    if (!conn || !params) {
+        return;
+    }
+
+    /* Start characteristic discovery after MTU exchange completes (success or failure). */
+    struct dean_link *link = CONTAINER_OF(params, struct dean_link, mtu_params);
+    if (link && link->conn == conn) {
+        int d_err = start_discovery_link(link);
+        if (d_err) {
+            LOG_WRN("[MTU] start discovery error after MTU exchange: %d", d_err);
+            bt_conn_disconnect(link->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        }
+    }
 }
 
 static void connected(struct bt_conn *conn, uint8_t conn_err)
@@ -1021,14 +1059,18 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 
             routing_track_connection(link->conn);
 
-            err = start_discovery_link(link);
+            memset(&link->mtu_params, 0, sizeof(link->mtu_params));
+            link->mtu_params.func = mtu_exchanged_cb;
+            err = bt_gatt_exchange_mtu(link->conn, &link->mtu_params);
             if (err) {
-                LOG_WRN("[CONNECTED] start discovery error : %d", err);
-                bt_conn_disconnect(link->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+                err = start_discovery_link(link);
+                if (err) {
+                    LOG_WRN("[CONNECTED] start discovery error : %d", err);
+                    bt_conn_disconnect(link->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+                }
             }
-            else {
-                LOG_INF("[CONNECTED] Connection established as CENTRAL to peripheral %s", addr);
-            }
+
+            LOG_INF("[CONNECTED] Connection established as CENTRAL to peripheral %s", addr);
 
             atomic_set(&initiating, 0);
             LOG_INF("[CONNECTED] New peripheral device connected : %s", addr);
@@ -1101,6 +1143,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
         struct dean_link *link = find_link(conn);
         if (link) {
+            LOG_INF("[DISCONNECTED] clearing subscriptions and freeing link for %s", addr);
             memset(link->subs, 0, sizeof(link->subs));
             free_link(link);
         }
