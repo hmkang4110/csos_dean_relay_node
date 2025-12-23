@@ -12,6 +12,7 @@
 #include <zephyr/bluetooth/gatt.h>
 
 #include "ble.h"
+#include "ble_relay_control.h"
 #include "config_service.h"
 #include "grideye_service.h"
 #include "peripheral_service.h"
@@ -118,9 +119,32 @@ static bt_gatt_attr_write_func_t location_write_cb(struct bt_conn *conn,
                                                    uint16_t offset,
                                                    uint8_t flags)
 {
+    ARG_UNUSED(conn);
+    ARG_UNUSED(attr);
+    ARG_UNUSED(offset);
+    ARG_UNUSED(flags);
+
+    /* SLIMHUB -> RELAY write format: [0..5]=target DEAN MAC, [6..]=location string. */
+    if (len < 6) {
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+    }
+
+    const uint8_t *mac = buf;
+    const uint8_t *payload = mac + 6;
+    uint16_t payload_len = len - 6;
+
+    int fwd_err = relay_forward_location_to_dean(mac, payload, payload_len);
+    if (fwd_err) {
+        return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+    }
+
     dean_device_conf.update_flag = 1;
     memset(dean_device_conf.location, 0, sizeof(dean_device_conf.location));
-    memcpy(dean_device_conf.location, buf, len);
+    size_t copy_len = payload_len;
+    if (copy_len >= sizeof(dean_device_conf.location)) {
+        copy_len = sizeof(dean_device_conf.location) - 1;
+    }
+    memcpy(dean_device_conf.location, payload, copy_len);
 
     return len;
 }
@@ -412,4 +436,3 @@ BT_GATT_SERVICE_DEFINE(sound_svr,
  * 필요해지면 ubinos_service.h 에 정의된 UUID 로 위와 동일한 패턴으로
  * BT_GATT_SERVICE_DEFINE(...) 하나 더 만들어주면 된다.
  */
-

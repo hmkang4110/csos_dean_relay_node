@@ -9,3 +9,4 @@ int ble_relay_control_start(void);
 
 /* Downstream forwarding to DEAN (MAC in big-endian order) */
 int relay_forward_rawdata_to_dean(const uint8_t mac[6], const uint8_t *payload, uint16_t len);
+int relay_forward_location_to_dean(const uint8_t mac[6], const uint8_t *payload, uint16_t len);

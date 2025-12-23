@@ -44,6 +44,8 @@
 #include "relay_stub_service.h"
 #include "inference_service.h"
 #include "ble_relay_control.h"
+#include "ui.h"
+#include "config_service.h"
 
 struct dean_link;
 
@@ -54,6 +56,8 @@ static void reset_work_handler(struct k_work *work);
 static void adv_restart_work_handler(struct k_work *work);
 static void scan_restart_work_handler(struct k_work *work);
 static void initiate_timeout_work_handler(struct k_work *work);
+static void scan_idle_timeout_work_handler(struct k_work *work);
+static void adv_enable_work_handler(struct k_work *work);
 
 static void adv_start_safe(int delay_ms);
 static void adv_stop_safe(void);
@@ -76,6 +80,8 @@ K_WORK_DELAYABLE_DEFINE(adv_restart_work, adv_restart_work_handler);
 K_WORK_DELAYABLE_DEFINE(scan_restart_work, scan_restart_work_handler);
 K_WORK_DELAYABLE_DEFINE(reset_work, reset_work_handler);
 K_WORK_DELAYABLE_DEFINE(initiating_timeout_work, initiate_timeout_work_handler);
+K_WORK_DELAYABLE_DEFINE(scan_idle_timeout_work, scan_idle_timeout_work_handler);
+K_WORK_DELAYABLE_DEFINE(adv_enable_work, adv_enable_work_handler);
 
 /* GLOBAL PARAMETER DEFINITIONS */
 static uint32_t adv_backoff_ms = 200;
@@ -86,6 +92,17 @@ static uint32_t initiate_start_ms = 0;
 static atomic_t adv_on;
 static atomic_t scan_on;
 static atomic_t initiating;
+
+enum relay_phase {
+	RELAY_PHASE_SCAN_DEAN = 0,
+	RELAY_PHASE_ADV_SLIMHUB,
+};
+
+static enum relay_phase relay_phase = RELAY_PHASE_SCAN_DEAN;
+
+/* If no DEAN progress (match/connect) is seen for this long, assume there are no more scannable nodes. */
+#define SCAN_IDLE_TIMEOUT_MS 8000
+static uint32_t last_dean_activity_ms;
 
 struct adv_match_ctx
 {
@@ -98,13 +115,14 @@ static struct bt_conn *peripheral_conn;
 #define ROUTING_TABLE_SIZE 8
 #define DEAN_MAC_LEN       6
 #define MAX_DEAN_CONN      4
-#define MAX_SUBS_PER_CONN  12
+#define MAX_SUBS_PER_CONN  16
 
 enum relay_char_type
 {
     RELAY_CHAR_RAWDATA = 0,
     RELAY_CHAR_SEQ_RESULT,
     RELAY_CHAR_DEBUG_STRING,
+    RELAY_CHAR_LOCATION,
 };
 
 struct relay_route_entry
@@ -115,6 +133,7 @@ struct relay_route_entry
     uint16_t h_rawdata;
     uint16_t h_seq_result;
     uint16_t h_debug_string;
+    uint16_t h_location;
 };
 
 static struct relay_route_entry routing_table[ROUTING_TABLE_SIZE];
@@ -131,6 +150,25 @@ struct dean_link
 };
 
 static struct dean_link dean_links[MAX_DEAN_CONN];
+
+static void enter_scan_dean_phase(void)
+{
+	relay_phase = RELAY_PHASE_SCAN_DEAN;
+	k_work_cancel_delayable(&adv_enable_work);
+	k_work_cancel_delayable(&adv_restart_work);
+	adv_stop_safe();
+	scan_start_safe(0);
+	last_dean_activity_ms = k_uptime_get_32();
+	k_work_reschedule(&scan_idle_timeout_work, K_MSEC(SCAN_IDLE_TIMEOUT_MS));
+}
+
+static void enter_adv_slimhub_phase(int delay_ms)
+{
+	relay_phase = RELAY_PHASE_ADV_SLIMHUB;
+	scan_stop_safe();
+	k_work_cancel_delayable(&scan_idle_timeout_work);
+	adv_start_safe(delay_ms);
+}
 
 static inline bool mac_equal(const uint8_t *a, const uint8_t *b)
 {
@@ -276,6 +314,10 @@ static void routing_update_handle(struct bt_conn *conn,
         old = entry->h_debug_string;
         entry->h_debug_string = handle;
         break;
+    case RELAY_CHAR_LOCATION:
+        old = entry->h_location;
+        entry->h_location = handle;
+        break;
     default:
         break;
     }
@@ -285,7 +327,8 @@ static void routing_update_handle(struct bt_conn *conn,
         mac_to_str(entry->mac, mac_buf, sizeof(mac_buf));
         const char *type_str = (type == RELAY_CHAR_RAWDATA) ? "RAWDATA" :
                                (type == RELAY_CHAR_SEQ_RESULT) ? "SEQ_RESULT" :
-                               (type == RELAY_CHAR_DEBUG_STRING) ? "DEBUG_STR" : "UNKNOWN";
+                               (type == RELAY_CHAR_DEBUG_STRING) ? "DEBUG_STR" :
+                               (type == RELAY_CHAR_LOCATION) ? "LOCATION" : "UNKNOWN";
         LOG_INF("[ROUTE] %s handle=0x%04x (mac=%s)", type_str, handle, mac_buf);
     }
 }
@@ -341,6 +384,48 @@ int relay_forward_rawdata_to_dean(const uint8_t mac[DEAN_MAC_LEN],
         char mac_buf[MAC_ADDR_STR_LEN + 1];
         mac_to_str(mac, mac_buf, sizeof(mac_buf));
         LOG_WRN("[ROUTE] forward rawdata to %s failed err=%d", mac_buf, err);
+        link->write_in_progress = false;
+    } else {
+        ui_status_relay_activity();
+    }
+    return err;
+}
+
+int relay_forward_location_to_dean(const uint8_t mac[DEAN_MAC_LEN],
+                                   const uint8_t *payload,
+                                   uint16_t len)
+{
+    struct relay_route_entry *entry = routing_find_by_mac(mac);
+    struct dean_link *link = NULL;
+    if (entry) {
+        link = find_link(entry->conn);
+    }
+
+    if (!entry || !entry->conn || !entry->h_location || !link) {
+        return -ENODEV;
+    }
+
+    if (link->write_in_progress) {
+        return -EBUSY;
+    }
+
+    if (len > sizeof(link->write_buf)) {
+        return -EMSGSIZE;
+    }
+
+    memcpy(link->write_buf, payload, len);
+    link->write_params.func = forward_write_cb;
+    link->write_params.handle = entry->h_location;
+    link->write_params.offset = 0;
+    link->write_params.data = link->write_buf;
+    link->write_params.length = len;
+    link->write_in_progress = true;
+
+    int err = bt_gatt_write(entry->conn, &link->write_params);
+    if (err) {
+        char mac_buf[MAC_ADDR_STR_LEN + 1];
+        mac_to_str(mac, mac_buf, sizeof(mac_buf));
+        LOG_WRN("[ROUTE] forward location to %s failed err=%d", mac_buf, err);
         link->write_in_progress = false;
     }
     return err;
@@ -470,6 +555,18 @@ static void scan_restart_work_handler(struct  k_work *work)
         return;
     }
 
+    if (relay_phase != RELAY_PHASE_SCAN_DEAN) {
+        return;
+    }
+
+    if (atomic_get(&initiating) == 1 || central_pending) {
+        return;
+    }
+
+    if (!dean_has_space()) {
+        return;
+    }
+
     LOG_INF("[SCAN] scan restart work handler");
     int err = bt_le_scan_start(BLE_SCAN_ACTIVE_SLOW, scan_device_found);
 
@@ -497,6 +594,16 @@ static void scan_restart_work_handler(struct  k_work *work)
 static void adv_restart_work_handler(struct k_work *work)
 {
     int err = 0;
+
+    if (relay_phase != RELAY_PHASE_ADV_SLIMHUB) {
+        return;
+    }
+
+    /* Only advertise to accept SLIMHUB; do not advertise while already connected as peripheral. */
+    if (peripheral_conn) {
+        atomic_set(&adv_on, 0);
+        return;
+    }
 
     if (atomic_get(&adv_on)) {
         return;
@@ -526,7 +633,6 @@ static void adv_restart_work_handler(struct k_work *work)
     if (!err) {
         atomic_set(&adv_on, 1);
         adv_backoff_ms = 200;
-        scan_start_safe(1000);
 
         err = hci_vs_write_adv_tx_power(20);
         if (err == 0) {
@@ -559,6 +665,37 @@ static void initiate_timeout_work_handler(struct k_work *work)
         }
         scan_start_safe(300);
     }
+}
+
+static void scan_idle_timeout_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (relay_phase != RELAY_PHASE_SCAN_DEAN) {
+		return;
+	}
+
+	/* Keep scanning until we reach the maximum number of DEAN links. */
+	if (!dean_has_space()) {
+		enter_adv_slimhub_phase(0);
+		return;
+	}
+
+	if (atomic_get(&initiating) == 1 || central_pending) {
+		k_work_reschedule(&scan_idle_timeout_work, K_MSEC(SCAN_IDLE_TIMEOUT_MS));
+		return;
+	}
+
+	/* Ensure scanning stays active while we still have DEAN slots. */
+	scan_start_safe(0);
+
+	k_work_reschedule(&scan_idle_timeout_work, K_MSEC(SCAN_IDLE_TIMEOUT_MS));
+}
+
+static void adv_enable_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	enter_adv_slimhub_phase(0);
 }
 
 /* FUNCTION DEFINITIONS */
@@ -658,6 +795,10 @@ static void scan_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t typ
     char addr_str[BT_ADDR_LE_STR_LEN];
     int err;
 
+    if (relay_phase != RELAY_PHASE_SCAN_DEAN) {
+        return;
+    }
+
     if (central_pending || !dean_has_space()) {
         return;
     }
@@ -684,6 +825,9 @@ static void scan_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t typ
     if (!ctx.name_match) {
         return;
     }
+
+    last_dean_activity_ms = k_uptime_get_32();
+    k_work_reschedule(&scan_idle_timeout_work, K_MSEC(SCAN_IDLE_TIMEOUT_MS));
 
     /* Connect only to devices in close proximity */
     if (rssi < -95) {
@@ -731,7 +875,7 @@ static bool ad_parse_cb (struct bt_data * data, void *user_data)
         memcpy(ctx->found_name, data->data, n);
         ctx->found_name[n] = '\0';
 
-        char target_peripheral_name[20] = "DE&N";
+        char target_peripheral_name[20] = "DE&N_TERMINAL";
 
         if (strcmp(ctx->found_name, target_peripheral_name) == 0) {
             ctx->name_match = true;
@@ -756,7 +900,7 @@ static uint8_t discover_func(struct bt_conn *conn,
         LOG_INF("[DISCOVER] type %u complete", params->type);
         memset(params, 0, sizeof(*params));   /* 이 discover 작업은 끝 */
         /* resume scanning only after this link's discovery/subscriptions are done */
-        if (dean_has_space()) {
+        if (relay_phase == RELAY_PHASE_SCAN_DEAN && dean_has_space()) {
             atomic_set(&scan_on, 0);
             scan_start_safe(300);
         }
@@ -769,6 +913,11 @@ static uint8_t discover_func(struct bt_conn *conn,
         uint16_t decl_handle  = attr->handle;          /* Characteristic Declaration */
         uint16_t value_handle = chrc->value_handle;    /* Characteristic Value */
         const char *inf_name = NULL;
+
+        /* Track writable config characteristics even if they are not notifiable. */
+        if (!bt_uuid_cmp(chrc->uuid, BT_UUID_CHRC_LOCATION)) {
+            routing_update_handle(conn, RELAY_CHAR_LOCATION, value_handle);
+        }
 
         /* LOG_DBG("[DISCOVER] char decl=0x%04x val=0x%04x props=0x%02x",
                    decl_handle, value_handle, chrc->properties); */
@@ -913,6 +1062,9 @@ static uint8_t generic_notify_cb(struct bt_conn *conn,
         if (!entry->h_debug_string && conn_entry->h_debug_string) {
             entry->h_debug_string = conn_entry->h_debug_string;
         }
+        if (!entry->h_location && conn_entry->h_location) {
+            entry->h_location = conn_entry->h_location;
+        }
     }
 
     if (entry && !entry->conn) {
@@ -930,6 +1082,8 @@ static uint8_t generic_notify_cb(struct bt_conn *conn,
         if (err && err != -EACCES)
         {
             LOG_WRN("[RELAY] INFERENCE_RAWDATA send failed (err %d)", err);
+        } else if (err == 0) {
+            ui_status_relay_activity();
         }
     }
     else if (entry && entry->h_seq_result && handle == entry->h_seq_result)
@@ -941,6 +1095,8 @@ static uint8_t generic_notify_cb(struct bt_conn *conn,
         if (err && err != -EACCES)
         {
             LOG_WRN("[RELAY] INFERENCE_SEQ_ANAL_RESULT send failed (err %d)", err);
+        } else if (err == 0) {
+            ui_status_relay_activity();
         }
     }
     else if (entry && entry->h_debug_string && handle == entry->h_debug_string)
@@ -954,6 +1110,8 @@ static uint8_t generic_notify_cb(struct bt_conn *conn,
         if (err && err != -EACCES)
         {
             LOG_WRN("[RELAY] INFERENCE_DEBUG_STRING send failed (err %d)", err);
+        } else if (err == 0) {
+            ui_status_relay_activity();
         }
     }
     else 
@@ -1018,7 +1176,9 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 
             atomic_set(&initiating, 0);
             atomic_set(&scan_on, 0);
-            scan_start_safe(300);
+            if (relay_phase == RELAY_PHASE_SCAN_DEAN) {
+                scan_start_safe(300);
+            }
             return;
         }
         else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
@@ -1070,11 +1230,23 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
                 }
             }
 
+            ui_status_dean_connected();
             LOG_INF("[CONNECTED] Connection established as CENTRAL to peripheral %s", addr);
 
             atomic_set(&initiating, 0);
             LOG_INF("[CONNECTED] New peripheral device connected : %s", addr);
-        }
+
+            /* Reset scan idle timer based on actual connection progress (not just scan matches). */
+            last_dean_activity_ms = k_uptime_get_32();
+            if (relay_phase == RELAY_PHASE_SCAN_DEAN) {
+                k_work_reschedule(&scan_idle_timeout_work, K_MSEC(SCAN_IDLE_TIMEOUT_MS));
+            }
+
+	            /* If we've filled all DEAN slots, switch to advertising immediately. */
+	            if (relay_phase == RELAY_PHASE_SCAN_DEAN && !dean_has_space()) {
+	                enter_adv_slimhub_phase(0);
+	            }
+	        }
         else if (info.role == BT_CONN_ROLE_PERIPHERAL) {
             /* relay node 가 PERIPHERAL 로서 SLIMHUB 에 붙은 상황 */
 
@@ -1082,6 +1254,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
                 peripheral_conn = bt_conn_ref(conn);
             }
 
+            ui_status_slimhub_connected();
             LOG_INF("[CONNECTED] Connection established as PERIPHERAL with central %s", addr);
             atomic_set(&adv_on, 0);
         }
@@ -1131,6 +1304,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
         /* 필요하면 inference_svr 의 notify enable 플래그들 초기화 (옵션) */
 
+        ui_status_slimhub_disconnected();
         atomic_set(&adv_on, 0);
         adv_start_safe(300);
     }
@@ -1154,10 +1328,9 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
         atomic_set(&initiating, 0);
 
-        atomic_set(&scan_on, 0);
-        if (dean_has_space()) {
-            scan_start_safe(300);
-        }
+        ui_status_dean_disconnected();
+        /* Losing a DEAN link returns us to the "scan DEAN first" phase. */
+        enter_scan_dean_phase();
     } else {
         LOG_INF("[DISCONNECTED] Disconnected from %s (reason %u), unknown role=%d",
                 addr, reason, info.role);
@@ -1189,7 +1362,7 @@ int ble_relay_control_start(void)
         k_sleep(K_MSEC(500));
     }
 
-    adv_start_safe(0);
+    enter_scan_dean_phase();
 
     return err;
 }

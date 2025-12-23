@@ -20,6 +20,82 @@
 
 #define SLEEP_TIME_MS	1
 
+enum ui_status_event {
+	UI_EVT_DEAN_CONNECTED = 1,
+	UI_EVT_SLIMHUB_CONNECTED,
+	UI_EVT_DEAN_DISCONNECTED,
+	UI_EVT_SLIMHUB_DISCONNECTED,
+	UI_EVT_RELAY_ACTIVITY,
+};
+
+K_MSGQ_DEFINE(ui_evt_msgq, sizeof(uint8_t), 16, 1);
+
+#define UI_THREAD_STACK_SIZE 1024
+/* Keep UI thread at the lowest app priority so it never interferes with BLE. */
+#define UI_THREAD_PRIORITY   K_LOWEST_APPLICATION_THREAD_PRIO
+K_THREAD_STACK_DEFINE(ui_thread_stack, UI_THREAD_STACK_SIZE);
+static struct k_thread ui_thread_data;
+
+static uint32_t last_relay_evt_ms;
+#define RELAY_ACTIVITY_COOLDOWN_MS 250
+
+static void set_rgb(bool r, bool g, bool b)
+{
+	led_set(RED_LED, r ? 1 : 0);
+	led_set(GREEN_LED, g ? 1 : 0);
+	led_set(BLUE_LED, b ? 1 : 0);
+}
+
+static void blink_rgb(bool r, bool g, bool b, int times, int on_ms, int off_ms)
+{
+	for (int i = 0; i < times; i++) {
+		set_rgb(r, g, b);
+		k_sleep(K_MSEC(on_ms));
+		set_rgb(false, false, false);
+		k_sleep(K_MSEC(off_ms));
+	}
+}
+
+static void ui_thread_fn(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a);
+	ARG_UNUSED(b);
+	ARG_UNUSED(c);
+
+	uint8_t evt;
+	while (1) {
+		if (k_msgq_get(&ui_evt_msgq, &evt, K_FOREVER) != 0) {
+			continue;
+		}
+
+		switch ((enum ui_status_event)evt) {
+		case UI_EVT_DEAN_CONNECTED:          /* GREEN */
+			blink_rgb(false, true, false, 2, 220, 180);
+			break;
+		case UI_EVT_SLIMHUB_CONNECTED:       /* BLUE */
+			blink_rgb(false, false, true, 2, 220, 180);
+			break;
+		case UI_EVT_DEAN_DISCONNECTED:       /* RED x1 */
+			blink_rgb(true, false, false, 1, 300, 200);
+			break;
+		case UI_EVT_SLIMHUB_DISCONNECTED:    /* RED x2 */
+			blink_rgb(true, false, false, 2, 300, 200);
+			break;
+		case UI_EVT_RELAY_ACTIVITY:          /* YELLOW (R+G) */
+			blink_rgb(true, true, false, 1, 90, 0);
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+static void ui_post_evt(uint8_t evt)
+{
+	/* Drop if queue is full; status indications are best-effort. */
+	(void)k_msgq_put(&ui_evt_msgq, &evt, K_NO_WAIT);
+}
+
 /*
  * Get button configuration from the devicetree sw0 alias. This is mandatory.
  */
@@ -113,6 +189,19 @@ int led_init()
 			printk("Set up LED at %s pin %d\n", blue_led.port->name, blue_led.pin);
 		}
 	}
+
+	/* Ensure LEDs start OFF. */
+	if (red_led.port) {
+		gpio_pin_set_dt(&red_led, 0);
+	}
+	if (green_led.port) {
+		gpio_pin_set_dt(&green_led, 0);
+	}
+	if (blue_led.port) {
+		gpio_pin_set_dt(&blue_led, 0);
+	}
+
+	return 0;
 }
 
 int led_set(int color, int value)
@@ -154,6 +243,52 @@ int blink_led(int color, int times)
 		k_sleep(K_MSEC(100));
 	}
 	return 0;
+}
+
+int ui_status_init(void)
+{
+	last_relay_evt_ms = 0;
+	k_thread_create(&ui_thread_data, ui_thread_stack, UI_THREAD_STACK_SIZE,
+			ui_thread_fn, NULL, NULL, NULL,
+			UI_THREAD_PRIORITY, 0, K_NO_WAIT);
+	k_thread_name_set(&ui_thread_data, "ui_status");
+	return 0;
+}
+
+void ui_status_dean_connected(void)
+{
+	uint8_t evt = UI_EVT_DEAN_CONNECTED;
+	ui_post_evt(evt);
+}
+
+void ui_status_slimhub_connected(void)
+{
+	uint8_t evt = UI_EVT_SLIMHUB_CONNECTED;
+	ui_post_evt(evt);
+}
+
+void ui_status_dean_disconnected(void)
+{
+	uint8_t evt = UI_EVT_DEAN_DISCONNECTED;
+	ui_post_evt(evt);
+}
+
+void ui_status_slimhub_disconnected(void)
+{
+	uint8_t evt = UI_EVT_SLIMHUB_DISCONNECTED;
+	ui_post_evt(evt);
+}
+
+void ui_status_relay_activity(void)
+{
+	uint32_t now = k_uptime_get_32();
+	if ((now - last_relay_evt_ms) < RELAY_ACTIVITY_COOLDOWN_MS) {
+		return;
+	}
+	last_relay_evt_ms = now;
+
+	uint8_t evt = UI_EVT_RELAY_ACTIVITY;
+	ui_post_evt(evt);
 }
 
 void system_reboot()
