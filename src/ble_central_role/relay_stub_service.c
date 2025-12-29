@@ -414,7 +414,7 @@ static void ccc_cfg_sound_changed_event(const struct bt_gatt_attr *attr, uint16_
 BT_GATT_SERVICE_DEFINE(sound_svr,
     BT_GATT_PRIMARY_SERVICE(BT_UUID_SOUND_SERVICE),
 
-    BT_GATT_CHARACTERISTIC(BT_UUID_SOUND_SERVICE,
+    BT_GATT_CHARACTERISTIC(BT_UUID_CHRC_SOUND_MODEL,
                            BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
                            BT_GATT_PERM_READ,
                            dummy_read, NULL,

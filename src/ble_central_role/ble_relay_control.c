@@ -100,8 +100,10 @@ enum relay_phase {
 
 static enum relay_phase relay_phase = RELAY_PHASE_SCAN_DEAN;
 
-/* If no DEAN progress (match/connect) is seen for this long, assume there are no more scannable nodes. */
+/* Periodic idle check tick while scanning for DEAN nodes. */
 #define SCAN_IDLE_TIMEOUT_MS 8000
+/* If no DEAN progress (match/connect) is seen for this long, start advertising for SLIMHUB. */
+#define SCAN_IDLE_TO_ADV_MS 30000
 static uint32_t last_dean_activity_ms;
 
 struct adv_match_ctx
@@ -116,6 +118,90 @@ static struct bt_conn *peripheral_conn;
 #define DEAN_MAC_LEN       6
 #define MAX_DEAN_CONN      4
 #define MAX_SUBS_PER_CONN  16
+
+/*
+ * Connecting to multiple peripherals can be sensitive to scheduling.
+ * Using a slightly longer connection interval improves robustness when we have
+ * several simultaneous connections.
+ */
+static const struct bt_le_conn_param dean_conn_param = {
+    .interval_min = 0x0028, /* 50 ms  (40 * 1.25ms) */
+    .interval_max = 0x0050, /* 100 ms (80 * 1.25ms) */
+    .latency = 0,
+    .timeout = 400,         /* 4 s (400 * 10ms) */
+};
+
+#define CONNECT_FAIL_COOLDOWN_MS 5000
+#define CONNECT_FAIL_TABLE_SIZE  8
+
+struct connect_fail_entry {
+    bool valid;
+    bt_addr_le_t addr;
+    uint32_t until_ms;
+};
+
+static struct connect_fail_entry connect_fail_table[CONNECT_FAIL_TABLE_SIZE];
+
+static bool connect_fail_is_blocked(const bt_addr_le_t *addr)
+{
+    if (!addr) {
+        return false;
+    }
+
+    uint32_t now = k_uptime_get_32();
+
+    for (size_t i = 0; i < ARRAY_SIZE(connect_fail_table); i++) {
+        struct connect_fail_entry *e = &connect_fail_table[i];
+        if (!e->valid) {
+            continue;
+        }
+
+        if ((int32_t)(e->until_ms - now) <= 0) {
+            e->valid = false;
+            continue;
+        }
+
+        if (bt_addr_le_cmp(&e->addr, addr) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void connect_fail_note(const bt_addr_le_t *addr)
+{
+    if (!addr) {
+        return;
+    }
+
+    uint32_t now = k_uptime_get_32();
+    uint32_t until = now + CONNECT_FAIL_COOLDOWN_MS;
+
+    /* Update existing entry if present. */
+    for (size_t i = 0; i < ARRAY_SIZE(connect_fail_table); i++) {
+        struct connect_fail_entry *e = &connect_fail_table[i];
+        if (e->valid && bt_addr_le_cmp(&e->addr, addr) == 0) {
+            e->until_ms = until;
+            return;
+        }
+    }
+
+    /* Find an empty (or expired) slot. */
+    for (size_t i = 0; i < ARRAY_SIZE(connect_fail_table); i++) {
+        struct connect_fail_entry *e = &connect_fail_table[i];
+        if (!e->valid || (int32_t)(e->until_ms - now) <= 0) {
+            e->valid = true;
+            e->addr = *addr;
+            e->until_ms = until;
+            return;
+        }
+    }
+
+    /* If full, overwrite the first slot (bounded table). */
+    connect_fail_table[0].valid = true;
+    connect_fail_table[0].addr = *addr;
+    connect_fail_table[0].until_ms = until;
+}
 
 enum relay_char_type
 {
@@ -675,8 +761,13 @@ static void scan_idle_timeout_work_handler(struct k_work *work)
 		return;
 	}
 
-	/* Keep scanning until we reach the maximum number of DEAN links. */
-	if (!dean_has_space()) {
+	/* If we've been idle long enough (no match/connect progress), switch to SLIMHUB advertising. */
+	uint32_t now = k_uptime_get_32();
+	if ((int32_t)(now - last_dean_activity_ms) >= SCAN_IDLE_TO_ADV_MS) {
+		LOG_INF("[SCAN] idle %u ms -> switch to advertising (DEAN=%u/%u)",
+			(uint32_t)(now - last_dean_activity_ms),
+			(uint32_t)dean_active_count(),
+			(uint32_t)ARRAY_SIZE(dean_links));
 		enter_adv_slimhub_phase(0);
 		return;
 	}
@@ -834,16 +925,20 @@ static void scan_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t typ
         return;
     }
 
+    if (connect_fail_is_blocked(addr)) {
+        return;
+    }
+
     LOG_INF("[MATCH] name=\"%s\" from %s (RSSI %d)", ctx.found_name, addr_str, rssi);
 
     scan_stop_safe();
     atomic_set(&initiating, 1);
     initiate_start_ms = k_uptime_get_32();
-    // k_work_reschedule(&initiating_timeout_work, K_SECONDS(10));
+    k_work_reschedule(&initiating_timeout_work, K_SECONDS(8));
 
     err = bt_conn_le_create(addr,
                             BT_CONN_LE_CREATE_CONN,
-                            BT_LE_CONN_PARAM_DEFAULT,
+                            &dean_conn_param,
                             &tmp_conn);
     if (err) 
     {
@@ -1160,7 +1255,15 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
     struct bt_conn_info info;
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-    bt_conn_get_info(conn, &info);
+    err = bt_conn_get_info(conn, &info);
+    if (err) {
+        memset(&info, 0, sizeof(info));
+        if (peripheral_conn == conn) {
+            info.role = BT_CONN_ROLE_PERIPHERAL;
+        } else {
+            info.role = BT_CONN_ROLE_CENTRAL;
+        }
+    }
 
     /* connection failed */
     if (conn_err) {
@@ -1168,6 +1271,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
         if (info.role == BT_CONN_ROLE_CENTRAL) {
             /* CENTRAL: DEAN node 연결 실패 */
             LOG_WRN("[CONNECTED] Failed to connect to peripheral %s (err %u)", addr, conn_err);
+            connect_fail_note(bt_conn_get_dst(conn));
 
             if (central_pending == conn) {
                 bt_conn_unref(central_pending);
@@ -1176,6 +1280,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 
             atomic_set(&initiating, 0);
             atomic_set(&scan_on, 0);
+            k_work_cancel_delayable(&initiating_timeout_work);
             if (relay_phase == RELAY_PHASE_SCAN_DEAN) {
                 scan_start_safe(300);
             }
@@ -1192,6 +1297,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 
             /* 광고 다시 */
             atomic_set(&adv_on, 0);
+            k_work_cancel_delayable(&initiating_timeout_work);
             adv_start_safe(300);
             return;
         }
@@ -1234,6 +1340,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
             LOG_INF("[CONNECTED] Connection established as CENTRAL to peripheral %s", addr);
 
             atomic_set(&initiating, 0);
+            k_work_cancel_delayable(&initiating_timeout_work);
             LOG_INF("[CONNECTED] New peripheral device connected : %s", addr);
 
             /* Reset scan idle timer based on actual connection progress (not just scan matches). */
@@ -1257,6 +1364,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
             ui_status_slimhub_connected();
             LOG_INF("[CONNECTED] Connection established as PERIPHERAL with central %s", addr);
             atomic_set(&adv_on, 0);
+            k_work_cancel_delayable(&initiating_timeout_work);
         }
     }
 
@@ -1265,6 +1373,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
             (info.role == BT_CONN_ROLE_CENTRAL) ? "CENTRAL" : "PERIPHERAL");
 
     atomic_set(&initiating, 0);
+    k_work_cancel_delayable(&initiating_timeout_work);
 }
 
 

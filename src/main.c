@@ -9,8 +9,11 @@
 
 void main(void)
 {
-    printk("Relay Central discovery-subscribe start\n");
-
+    printk("=============================================\n");
+    printk("=============================================\n");
+    printk("== Relay Central discovery-subscribe start ==\n");
+    printk("=============================================\n");
+    printk("=============================================\n");
     int err = led_init();
     if (err) {
         /* LED init failed: show RED 3 times (best-effort). */
